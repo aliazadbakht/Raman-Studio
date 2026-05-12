@@ -1,0 +1,622 @@
+"""Main GUI for Raman Spectrum Analyzer – macOS."""
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading, time, os
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+
+from . import dsp, fileio
+from .camera import Camera, CameraError, list_cameras
+from .calibration_dialog import CalibrationDialog
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+BG        = "#1a1a2e"
+BG2       = "#16213e"
+ACCENT    = "#0f3460"
+CYAN      = "#00d4ff"
+ORANGE    = "#e94560"
+TEXT      = "#e0e0e0"
+MUTED     = "#888888"
+
+PLOT_BG   = "#0d1117"
+PLOT_FG   = "#00d4ff"
+GRID_COL  = "#1f2937"
+
+
+class RamanApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("Raman Spectrum Analyzer")
+        root.configure(bg=BG)
+        root.geometry("1280x820")
+        root.minsize(900, 600)
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self.camera: Camera | None = None
+        self.live_running = False
+        self._live_thread: threading.Thread | None = None
+
+        self.raw_signal: np.ndarray | None = None
+        self.blank_signal: np.ndarray | None = None
+        self.calibration = fileio.load_calibration()
+        self.x_axis: np.ndarray | None = None
+        self.x_label: str = "Pixel"
+
+        self.showpeaks_var = tk.BooleanVar(value=True)
+        self.peak_prom_var = tk.DoubleVar(value=5000.0)
+        self.peak_dist_var = tk.IntVar(value=20)
+
+        self._current_file: str = ""
+
+        # ── Layout ────────────────────────────────────────────────────────────
+        self._build_toolbar()
+        content = tk.Frame(root, bg=BG)
+        content.pack(fill="both", expand=True)
+        self._build_sidebar(content)
+        self._build_plot(content)
+        self._build_statusbar()
+
+        self._apply_ttk_style()
+        self._update_axis()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # UI Construction
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _build_toolbar(self):
+        bar = tk.Frame(self.root, bg=ACCENT, pady=4)
+        bar.pack(fill="x")
+
+        def btn(text, cmd, color=CYAN, width=9):
+            b = tk.Button(bar, text=text, command=cmd, bg=ACCENT, fg=color,
+                          font=("Helvetica", 9, "bold"), relief="flat",
+                          activebackground=BG2, activeforeground=CYAN,
+                          padx=6, pady=3, width=width)
+            b.pack(side="left", padx=2)
+            return b
+
+        def sep():
+            tk.Frame(bar, bg=BG2, width=2).pack(side="left", fill="y", padx=4, pady=2)
+
+        btn("📂 Open",    self.on_open)
+        btn("💾 Save",    self.on_save)
+        btn("📋 Copy",    self.on_copy)
+        btn("🖼 Image",   self.on_image_save)
+        sep()
+        self.btn_connect = btn("🔌 Connect", self.on_connect, color="#aaffaa")
+        self.btn_capture = btn("📷 Capture", self.on_capture)
+        self.btn_live    = btn("▶ Live",    self.on_live_toggle, color="#ffdd57")
+        sep()
+        btn("⬛ Set Blank",   self.on_set_blank,   color="#ffaa44")
+        btn("✖ Clr Blank",   self.on_clear_blank,  color="#ff6b6b", width=10)
+        sep()
+        btn("📐 Calibrate",  self.on_calibrate)
+        btn("⚙ Params",     self.on_params_toggle)
+        sep()
+        btn("❓ About",      self.on_about, color=MUTED, width=7)
+
+    def _apply_ttk_style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TCombobox", fieldbackground=ACCENT, background=ACCENT,
+                    foreground=TEXT, selectbackground=ACCENT)
+        s.configure("TScale", background=BG2, troughcolor=ACCENT)
+        s.configure("TCheckbutton", background=BG2, foreground=TEXT)
+        s.configure("TSpinbox", fieldbackground=ACCENT, foreground=TEXT)
+
+    def _build_sidebar(self, parent):
+        self.sidebar = tk.Frame(parent, bg=BG2, width=240)
+        self.sidebar.pack(side="left", fill="y", padx=(6,0), pady=6)
+        self.sidebar.pack_propagate(False)
+
+        def section(label):
+            tk.Label(self.sidebar, text=label, bg=BG2, fg=CYAN,
+                     font=("Helvetica", 9, "bold")).pack(anchor="w", padx=8, pady=(10,2))
+            tk.Frame(self.sidebar, bg=ACCENT, height=1).pack(fill="x", padx=8)
+
+        def row(label, widget_factory):
+            f = tk.Frame(self.sidebar, bg=BG2)
+            f.pack(fill="x", padx=8, pady=2)
+            tk.Label(f, text=label, bg=BG2, fg=TEXT,
+                     font=("Helvetica", 9), width=16, anchor="w").pack(side="left")
+            w = widget_factory(f)
+            w.pack(side="left", fill="x", expand=True)
+            return w
+
+        # ── Camera ────────────────────────────────────────────────────────────
+        section("Camera")
+        self.exposure_var = tk.DoubleVar(value=0.1)
+        self.exposure_label = tk.Label(self.sidebar, text="100 ms", bg=BG2, fg=CYAN,
+                                        font=("Helvetica", 8))
+        row("Exposure",
+            lambda f: ttk.Scale(f, from_=0.001, to=5.0, variable=self.exposure_var,
+                                orient="horizontal",
+                                command=lambda v: (self.exposure_label.config(
+                                    text=f"{float(v)*1000:.0f} ms"),
+                                    self._on_exposure(float(v)))))
+        self.exposure_label.pack(anchor="e", padx=12)
+
+        self.gain_var = tk.DoubleVar(value=0.0)
+        self.gain_label = tk.Label(self.sidebar, text="0.0 dB", bg=BG2, fg=CYAN,
+                                    font=("Helvetica", 8))
+        row("Gain (dB)",
+            lambda f: ttk.Scale(f, from_=0, to=24, variable=self.gain_var,
+                                orient="horizontal",
+                                command=lambda v: (self.gain_label.config(
+                                    text=f"{float(v):.1f} dB"),
+                                    self._on_gain(float(v)))))
+        self.gain_label.pack(anchor="e", padx=12)
+
+        self.roi_var = tk.IntVar(value=10)
+        row("ROI rows", lambda f: ttk.Spinbox(f, from_=1, to=1000,
+                                               textvariable=self.roi_var, width=7,
+                                               command=self._on_roi))
+
+        self.avg_var = tk.IntVar(value=1)
+        row("Averages", lambda f: ttk.Spinbox(f, from_=1, to=100,
+                                               textvariable=self.avg_var, width=7))
+
+        # ── Processing ────────────────────────────────────────────────────────
+        section("Processing")
+        self.medfilt_var = tk.BooleanVar(value=False)
+        row("Median filter", lambda f: ttk.Checkbutton(f, variable=self.medfilt_var,
+                                                        command=self._replot))
+        self.smooth_var = tk.IntVar(value=1)
+        row("Boxcar window", lambda f: ttk.Spinbox(f, from_=1, to=51,
+                                                    textvariable=self.smooth_var, width=7,
+                                                    command=self._replot))
+        self.baseline_var = tk.BooleanVar(value=False)
+        row("Baseline removal", lambda f: ttk.Checkbutton(f, variable=self.baseline_var,
+                                                           command=self._replot))
+        self.blank_var = tk.BooleanVar(value=True)
+        row("Blank subtraction", lambda f: ttk.Checkbutton(f, variable=self.blank_var,
+                                                            command=self._replot))
+
+        section("Savitzky-Golay")
+        self.sg_var = tk.BooleanVar(value=False)
+        row("Enable S-G", lambda f: ttk.Checkbutton(f, variable=self.sg_var,
+                                                     command=self._replot))
+        self.sg_window_var = tk.IntVar(value=11)
+        row("Window", lambda f: ttk.Spinbox(f, from_=3, to=101, increment=2,
+                                             textvariable=self.sg_window_var, width=7,
+                                             command=self._replot))
+        self.sg_order_var = tk.IntVar(value=3)
+        row("Order", lambda f: ttk.Spinbox(f, from_=1, to=10,
+                                            textvariable=self.sg_order_var, width=7,
+                                            command=self._replot))
+        self.sg_deriv_var = tk.IntVar(value=0)
+        row("Derivative", lambda f: ttk.Spinbox(f, from_=0, to=4,
+                                                 textvariable=self.sg_deriv_var, width=7,
+                                                 command=self._replot))
+
+        # ── Axis ──────────────────────────────────────────────────────────────
+        section("Axis")
+        self.axis_var = tk.StringVar(value="Raman Shifts" if self.calibration else "Pixels")
+        row("X-axis", lambda f: ttk.Combobox(f, textvariable=self.axis_var,
+                                              values=["Pixels","Wavelengths","Raman Shifts"],
+                                              state="readonly", width=14))
+        self.axis_var.trace_add("write", lambda *_: self._replot())
+
+        self.laser_var = tk.DoubleVar(value=532.0)
+        self.laser_entry = row("Laser (nm)", lambda f: tk.Entry(f, textvariable=self.laser_var, width=8,
+                                                                 bg=ACCENT, fg=TEXT, insertbackground=CYAN))
+        self.laser_entry.bind("<Return>", lambda *_: self._replot())
+        self.laser_entry.bind("<FocusOut>", lambda *_: self._replot())
+
+        # ── Peak Detection ────────────────────────────────────────────────────
+        section("Peak Detection")
+        row("Show peaks", lambda f: ttk.Checkbutton(f, variable=self.showpeaks_var,
+                                                     command=self._replot))
+        self.prom_label = tk.Label(self.sidebar, text="5000", bg=BG2, fg=CYAN,
+                                    font=("Helvetica", 8))
+        row("Prominence",
+            lambda f: ttk.Scale(f, from_=100, to=50000, variable=self.peak_prom_var,
+                                orient="horizontal",
+                                command=lambda v: (self.prom_label.config(
+                                    text=f"{float(v):.0f}"),
+                                    self._replot())))
+        self.prom_label.pack(anchor="e", padx=12)
+
+        row("Min distance", lambda f: ttk.Spinbox(f, from_=1, to=500,
+                                                   textvariable=self.peak_dist_var, width=7,
+                                                   command=self._replot))
+
+        # ── Saturation ────────────────────────────────────────────────────────
+        section("Display")
+        self.showsat_var = tk.BooleanVar(value=False)
+        row("Show saturation", lambda f: ttk.Checkbutton(f, variable=self.showsat_var,
+                                                          command=self._replot))
+        self.showroi_var = tk.BooleanVar(value=False)
+        row("Show ROI profile", lambda f: ttk.Checkbutton(f, variable=self.showroi_var,
+                                                           command=self._replot))
+
+    def _build_plot(self, parent):
+        plot_frame = tk.Frame(parent, bg=BG)
+        plot_frame.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+
+        self.fig = Figure(facecolor=PLOT_BG)
+        self.ax  = self.fig.add_subplot(111)
+        self._style_axes(self.ax)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        toolbar_frame = tk.Frame(plot_frame, bg=PLOT_BG)
+        toolbar_frame.pack(fill="x")
+        self.nav = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.nav.configure(background=PLOT_BG)
+        self.nav.update()
+
+        # Crosshair / cursor
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+    def _build_statusbar(self):
+        bar = tk.Frame(self.root, bg=ACCENT, pady=2)
+        bar.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value="Ready  |  No camera connected  |  No calibration")
+        tk.Label(bar, textvariable=self.status_var, bg=ACCENT, fg=TEXT,
+                 font=("Helvetica", 9), anchor="w").pack(side="left", padx=8)
+        self.cursor_var = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self.cursor_var, bg=ACCENT, fg=CYAN,
+                 font=("Helvetica", 9), anchor="e").pack(side="right", padx=8)
+
+    def _style_axes(self, ax):
+        ax.set_facecolor(PLOT_BG)
+        ax.tick_params(colors=TEXT, labelsize=8)
+        ax.xaxis.label.set_color(TEXT)
+        ax.yaxis.label.set_color(TEXT)
+        ax.title.set_color(CYAN)
+        for sp in ax.spines.values():
+            sp.set_color(GRID_COL)
+        ax.grid(True, color=GRID_COL, linestyle="--", linewidth=0.5, alpha=0.6)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Toolbar actions
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def on_open(self):
+        path = filedialog.askopenfilename(
+            title="Open Spectrum",
+            filetypes=[("OpenRAMAN SPC files","*.spc"),("CSV files","*.csv"),
+                       ("RSPC files","*.rspc"),("All files","*.*")])
+        if not path:
+            return
+        try:
+            lower_path = path.lower()
+            if lower_path.endswith(".spc"):
+                signal, cal, blank, config = fileio.load_spc(path)
+                self.raw_signal = signal
+                if cal:
+                    self.calibration = cal
+                if blank is not None:
+                    self.blank_signal = blank
+            elif lower_path.endswith(".rspc"):
+                signal, cal, blank, config = fileio.load_rspc(path)
+                self.raw_signal = signal
+                if cal:
+                    self.calibration = cal
+                if blank is not None:
+                    self.blank_signal = blank
+            else:
+                x, y, xl, yl = fileio.load_csv(path)
+                self.raw_signal = y
+                self.x_axis = x
+                self.x_label = xl
+            self._current_file = path
+            self._update_axis()
+            self._replot()
+            self._set_status(f"Opened: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Open Error", str(e))
+
+    def on_save(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Spectrum",
+            defaultextension=".spc",
+            filetypes=[("OpenRAMAN SPC files","*.spc"),("CSV files","*.csv"),
+                       ("RSPC files","*.rspc")])
+        if not path or self.raw_signal is None:
+            return
+        try:
+            x = self.x_axis if self.x_axis is not None else np.arange(len(self.raw_signal))
+            lower_path = path.lower()
+            if lower_path.endswith(".spc"):
+                uid = self.camera.uid if self.camera else ""
+                fileio.save_spc(path, self.raw_signal, self.calibration, self.blank_signal, uid=uid)
+            elif lower_path.endswith(".rspc"):
+                fileio.save_rspc(path, self.raw_signal, self.calibration, self.blank_signal)
+            else:
+                fileio.save_csv(path, x, self._processed_signal(), self.x_label, "Intensity")
+            self._set_status(f"Saved: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def on_copy(self):
+        if self.raw_signal is None:
+            return
+        x = self.x_axis if self.x_axis is not None else np.arange(len(self.raw_signal))
+        lines = [f"{self.x_label},Intensity"]
+        for xi, yi in zip(x, self._processed_signal()):
+            lines.append(f"{xi:.5e},{yi:.5e}")
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self._set_status("Spectrum copied to clipboard.")
+
+    def on_image_save(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Plot Image",
+            defaultextension=".png",
+            filetypes=[("PNG","*.png"),("PDF","*.pdf"),("SVG","*.svg")])
+        if path:
+            self.fig.savefig(path, dpi=150, bbox_inches="tight")
+            self._set_status(f"Image saved: {os.path.basename(path)}")
+
+    def on_connect(self):
+        cams = list_cameras()
+        if not cams:
+            messagebox.showinfo("No Camera", "No cameras found. Check connection.")
+            return
+        
+        # Simple picker if multiple cameras
+        cam_type, cam_idx = cams[0][0], cams[0][1]
+        if len(cams) > 1:
+            dlg = _CameraPickerDialog(self.root, cams)
+            self.root.wait_window(dlg)
+            if dlg.result is None:
+                return
+            cam_type, cam_idx = dlg.result
+        
+        try:
+            if self.camera:
+                self.camera.release()
+            self.camera = Camera(type=cam_type, index=cam_idx)
+            self.camera.set_roi(self.roi_var.get())
+            self.btn_connect.config(text="✓ Connected", fg="#00ff88")
+            self._set_status(f"Connected: {self.camera.uid}  |  {self.camera.width}×{self.camera.height}px")
+        except CameraError as e:
+            messagebox.showerror("Camera Error", str(e))
+
+    def on_capture(self):
+        if self.camera is None:
+            messagebox.showinfo("No Camera", "Connect a camera first.")
+            return
+        n = self.avg_var.get()
+        try:
+            accumulated = None
+            for _ in range(n):
+                sig, sat, roi = self.camera.acquire_spectrum()
+                accumulated = sig if accumulated is None else accumulated + sig
+            self.raw_signal = accumulated / n
+            self._sat_signal = sat
+            self._roi_signal = roi
+            self._update_axis()
+            self._replot()
+            self._set_status(f"Captured ({n} avg)  |  {len(self.raw_signal)} pixels")
+        except Exception as e:
+            messagebox.showerror("Acquisition Error", str(e))
+
+    def on_live_toggle(self):
+        if self.live_running:
+            self.live_running = False
+            self.btn_live.config(text="▶ Live", fg="#ffdd57")
+            self._set_status("Live stopped.")
+        else:
+            if self.camera is None:
+                messagebox.showinfo("No Camera", "Connect a camera first.")
+                return
+            self.live_running = True
+            self.btn_live.config(text="⏹ Stop", fg=ORANGE)
+            self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
+            self._live_thread.start()
+
+    def _live_loop(self):
+        while self.live_running:
+            try:
+                sig, sat, roi = self.camera.acquire_spectrum()
+                self.raw_signal = sig
+                self._sat_signal = sat
+                self._roi_signal = roi
+                self.root.after(0, self._replot)
+            except Exception:
+                self.live_running = False
+                break
+            time.sleep(max(0.02, self.exposure_var.get()))
+
+    def on_set_blank(self):
+        if self.raw_signal is None:
+            messagebox.showinfo("No Data", "Acquire or load a spectrum first.")
+            return
+        self.blank_signal = self.raw_signal.copy()
+        self._set_status("Blank set.")
+        self._replot()
+
+    def on_clear_blank(self):
+        self.blank_signal = None
+        self._set_status("Blank cleared.")
+        self._replot()
+
+    def on_calibrate(self):
+        CalibrationDialog(self.root, self.raw_signal, self._on_calibration_solution)
+
+    def _on_calibration_solution(self, coeffs):
+        self.calibration = list(coeffs)
+        fileio.save_calibration(coeffs)
+        self.axis_var.set("Raman Shifts")
+        self._set_status(f"Calibration applied and saved. Axis set to Raman Shifts.")
+        self._update_axis()
+        self._replot()
+
+    def on_params_toggle(self):
+        if self.sidebar.winfo_ismapped():
+            self.sidebar.pack_forget()
+        else:
+            self.sidebar.pack(side="left", fill="y", padx=(6,0), pady=6,
+                              before=self.canvas.get_tk_widget().master)
+
+    def on_about(self):
+        messagebox.showinfo("About",
+            "Raman Spectrum Analyzer\nmacOS Edition\n\n"
+            "Based on The Pulsar Engineering SpectrumAnalyzer (CERN OHL-W v2)\n"
+            "macOS port: Python/Tkinter/Matplotlib")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Camera callbacks
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _on_exposure(self, v):
+        if self.camera:
+            self.camera.set_exposure(v)
+
+    def _on_gain(self, v):
+        if self.camera:
+            self.camera.set_gain(v)
+
+    def _on_roi(self):
+        if self.camera:
+            self.camera.set_roi(self.roi_var.get())
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Axis computation
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _update_axis(self):
+        if self.raw_signal is None:
+            return
+        n = len(self.raw_signal)
+        ax_type = self.axis_var.get()
+
+        if ax_type == "Pixels" or self.calibration is None:
+            self.x_axis  = np.arange(n, dtype=float)
+            self.x_label = "Pixel"
+        elif ax_type == "Wavelengths":
+            self.x_axis  = dsp.pixels_to_wavelengths(self.calibration, n)
+            self.x_label = "Wavelength (nm)"
+        else:  # Raman Shifts
+            wl = dsp.pixels_to_wavelengths(self.calibration, n)
+            try:
+                laser = float(self.laser_var.get())
+            except Exception:
+                laser = 532.0
+            self.x_axis  = dsp.wavelengths_to_raman(wl, laser)
+            self.x_label = "Raman Shift (cm⁻¹)"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Plotting
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _replot(self, *_):
+        if self.raw_signal is None:
+            return
+        self._update_axis()
+
+        y_proc = self._processed_signal()
+
+        x = self.x_axis if self.x_axis is not None else np.arange(len(y_proc))
+
+        self.ax.cla()
+        self._style_axes(self.ax)
+
+        # Main spectrum
+        self.ax.plot(x, y_proc, color=CYAN, linewidth=1.2, label="Spectrum")
+
+        # Saturation overlay
+        if self.showsat_var.get() and hasattr(self, "_sat_signal") and self._sat_signal is not None:
+            s = self._sat_signal
+            if len(s) == len(x):
+                self.ax.plot(x, s / s.max() * y_proc.max(),
+                             color=ORANGE, linewidth=0.8, alpha=0.6, label="Saturation")
+
+        # Peak annotations
+        if self.showpeaks_var.get() and self.raw_signal is not None:
+            peaks = dsp.detect_peaks(y_proc, 
+                                     prominence=self.peak_prom_var.get(),
+                                     distance=self.peak_dist_var.get())
+            if len(peaks):
+                self.ax.plot(x[peaks], y_proc[peaks], "x", color=ORANGE,
+                             markersize=8, markeredgewidth=1.5)
+                for pk in peaks:
+                    val_x = x[pk]
+                    self.ax.annotate(f"{val_x:.1f}",
+                                     xy=(val_x, y_proc[pk]),
+                                     xytext=(0, 8), textcoords="offset points",
+                                     ha="center", fontsize=7, color=ORANGE)
+
+        self.ax.set_xlabel(self.x_label, color=TEXT, fontsize=9)
+        self.ax.set_ylabel("Intensity (a.u.)", color=TEXT, fontsize=9)
+        self.ax.set_title("Raman Spectrum", color=CYAN, fontsize=10, fontweight="bold")
+
+        if self.blank_signal is not None and self.blank_var.get():
+            self.ax.text(0.01, 0.97, "● Blank subtracted", transform=self.ax.transAxes,
+                         fontsize=7, color="#ffaa44", va="top")
+
+        self.canvas.draw_idle()
+
+    def _processed_signal(self):
+        return dsp.process_spectrum(
+            self.raw_signal,
+            blank_y=self.blank_signal,
+            use_blank=self.blank_var.get() and self.blank_signal is not None,
+            use_median=self.medfilt_var.get(),
+            boxcar_window=max(1, self.smooth_var.get()),
+            use_baseline=self.baseline_var.get(),
+            use_sgolay=self.sg_var.get(),
+            sg_window=max(3, self.sg_window_var.get()),
+            sg_order=max(1, self.sg_order_var.get()),
+            sg_deriv=self.sg_deriv_var.get(),
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Mouse
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _on_mouse_move(self, event):
+        if event.inaxes == self.ax and event.xdata is not None:
+            self.cursor_var.set(f"x={event.xdata:.2f}  y={event.ydata:.2f}")
+        else:
+            self.cursor_var.set("")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Status
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _set_status(self, msg):
+        cam = self.camera.uid if self.camera else "No camera"
+        cal = "Calibrated" if self.calibration else "Uncalibrated"
+        self.status_var.set(f"{msg}  |  {cam}  |  {cal}")
+
+
+# ── Camera picker helper ───────────────────────────────────────────────────────
+
+class _CameraPickerDialog(tk.Toplevel):
+    def __init__(self, parent, camera_info):
+        super().__init__(parent)
+        self.title("Select Camera")
+        self.configure(bg=BG)
+        self.result = None
+        self.resizable(False, False)
+        
+        tk.Label(self, text="Choose camera:", bg=BG, fg=TEXT,
+                 font=("Helvetica", 11)).pack(padx=20, pady=10)
+        
+        self.selection = tk.StringVar(value=f"{camera_info[0][0]}:{camera_info[0][1]}")
+        
+        for ctype, cidx, cname in camera_info:
+            tk.Radiobutton(self, text=cname, variable=self.selection, 
+                           value=f"{ctype}:{cidx}",
+                           bg=BG, fg=TEXT, selectcolor=ACCENT,
+                           activebackground=BG).pack(anchor="w", padx=20)
+        
+        tk.Button(self, text="OK", command=self._ok,
+                  bg=CYAN, fg="#000", font=("Helvetica", 10, "bold"),
+                  relief="flat", padx=16, pady=4).pack(pady=12)
+        self.grab_set()
+
+    def _ok(self):
+        ctype, cidx = self.selection.get().split(":")
+        self.result = (ctype, int(cidx))
+        self.destroy()
