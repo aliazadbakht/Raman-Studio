@@ -11,7 +11,8 @@ from matplotlib.figure import Figure
 
 from . import dsp, fileio
 from .camera import Camera, CameraError, list_cameras
-from .calibration_dialog import CalibrationDialog
+from .calibration_dialog import CalibrationDialog, SampleCalibrationDialog
+from .match_panel import MatchPanel
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BG        = "#1a1a2e"
@@ -45,19 +46,26 @@ class RamanApp:
         self.calibration = fileio.load_calibration()
         self.x_axis: np.ndarray | None = None
         self.x_label: str = "Pixel"
+        # Original x-axis from a loaded CSV / RRUFF file (in whatever
+        # units the file provided). Lets us match against the library
+        # without a per-instrument calibration.
+        self._loaded_x: np.ndarray | None = None
+        self._loaded_x_label: str = ""
 
         self.showpeaks_var = tk.BooleanVar(value=True)
         self.peak_prom_var = tk.DoubleVar(value=5000.0)
         self.peak_dist_var = tk.IntVar(value=20)
 
         self._current_file: str = ""
+        self._cal_health: dict | None = None
 
         # ── Layout ────────────────────────────────────────────────────────────
         self._build_toolbar()
-        content = tk.Frame(root, bg=BG)
-        content.pack(fill="both", expand=True)
-        self._build_sidebar(content)
-        self._build_plot(content)
+        self.content = tk.Frame(root, bg=BG)
+        self.content.pack(fill="both", expand=True)
+        self._build_sidebar(self.content)
+        self._build_match_panel(self.content)
+        self._build_plot(self.content)
         self._build_statusbar()
 
         self._apply_ttk_style()
@@ -94,8 +102,11 @@ class RamanApp:
         btn("⬛ Set Blank",   self.on_set_blank,   color="#ffaa44")
         btn("✖ Clr Blank",   self.on_clear_blank,  color="#ff6b6b", width=10)
         sep()
+        btn("🧪 Quick Cal", self.on_quick_calibrate, color="#aaffaa", width=10)
         btn("📐 Calibrate",  self.on_calibrate)
         btn("⚙ Params",     self.on_params_toggle)
+        sep()
+        self.btn_match = btn("🔬 Match", self.on_match_toggle, color="#a3ffd9")
         sep()
         btn("❓ About",      self.on_about, color=MUTED, width=7)
 
@@ -129,15 +140,32 @@ class RamanApp:
 
         # ── Camera ────────────────────────────────────────────────────────────
         section("Camera")
+        # Exposure: log-scaled slider so 1ms..60s all get usable slider travel.
+        # Plus a numeric entry for arbitrary values (FLIR cameras accept
+        # several minutes; entry isn't bound to the slider's range).
         self.exposure_var = tk.DoubleVar(value=0.1)
+        self._exp_slider_var = tk.DoubleVar(value=self._sec_to_slider(0.1))
+        self._exp_syncing = False     # guard against feedback loops
         self.exposure_label = tk.Label(self.sidebar, text="100 ms", bg=BG2, fg=CYAN,
                                         font=("Helvetica", 8))
-        row("Exposure",
-            lambda f: ttk.Scale(f, from_=0.001, to=5.0, variable=self.exposure_var,
-                                orient="horizontal",
-                                command=lambda v: (self.exposure_label.config(
-                                    text=f"{float(v)*1000:.0f} ms"),
-                                    self._on_exposure(float(v)))))
+        exp_frame = tk.Frame(self.sidebar, bg=BG2)
+        exp_frame.pack(fill="x", padx=8, pady=2)
+        tk.Label(exp_frame, text="Exposure", bg=BG2, fg=TEXT,
+                 font=("Helvetica", 9), width=16, anchor="w").pack(side="left")
+        ttk.Scale(exp_frame, from_=0.0, to=1000.0,
+                  variable=self._exp_slider_var,
+                  orient="horizontal",
+                  command=self._on_exposure_slider
+                  ).pack(side="left", fill="x", expand=True)
+        exp_entry = tk.Entry(self.sidebar, textvariable=self.exposure_var, width=8,
+                              bg=ACCENT, fg=TEXT, insertbackground=CYAN,
+                              justify="right")
+        exp_entry.pack(anchor="e", padx=12, pady=(2, 0))
+        tk.Label(self.sidebar, text="seconds (type for >60 s)",
+                 bg=BG2, fg=MUTED, font=("Helvetica", 7)
+                 ).pack(anchor="e", padx=12)
+        exp_entry.bind("<Return>", self._on_exposure_entry)
+        exp_entry.bind("<FocusOut>", self._on_exposure_entry)
         self.exposure_label.pack(anchor="e", padx=12)
 
         self.gain_var = tk.DoubleVar(value=0.0)
@@ -207,6 +235,40 @@ class RamanApp:
         self.laser_entry.bind("<Return>", lambda *_: self._replot())
         self.laser_entry.bind("<FocusOut>", lambda *_: self._replot())
 
+        # ── X-range ───────────────────────────────────────────────────────────
+        # Manual X-axis limits. Empty / non-numeric = auto (matplotlib default).
+        self.xmin_var = tk.StringVar(value="")
+        self.xmax_var = tk.StringVar(value="")
+        xr_frame = tk.Frame(self.sidebar, bg=BG2)
+        xr_frame.pack(fill="x", padx=8, pady=2)
+        tk.Label(xr_frame, text="X range", bg=BG2, fg=TEXT,
+                 font=("Helvetica", 9), width=16, anchor="w").pack(side="left")
+        self.xmin_entry = tk.Entry(xr_frame, textvariable=self.xmin_var, width=6,
+                                    bg=ACCENT, fg=TEXT, insertbackground=CYAN)
+        self.xmin_entry.pack(side="left", padx=(0, 2))
+        tk.Label(xr_frame, text="–", bg=BG2, fg=MUTED).pack(side="left")
+        self.xmax_entry = tk.Entry(xr_frame, textvariable=self.xmax_var, width=6,
+                                    bg=ACCENT, fg=TEXT, insertbackground=CYAN)
+        self.xmax_entry.pack(side="left", padx=(2, 0))
+        for w in (self.xmin_entry, self.xmax_entry):
+            w.bind("<Return>", lambda *_: self._replot())
+            w.bind("<FocusOut>", lambda *_: self._replot())
+
+        xr_btns = tk.Frame(self.sidebar, bg=BG2)
+        xr_btns.pack(fill="x", padx=8, pady=(0, 4))
+        tk.Button(xr_btns, text="Auto", command=self._x_auto,
+                  bg=ACCENT, fg=CYAN, relief="flat",
+                  font=("Helvetica", 8), padx=8, pady=1
+                  ).pack(side="left", padx=2)
+        tk.Button(xr_btns, text="100–3500", command=lambda: self._x_set(100, 3500),
+                  bg=ACCENT, fg=TEXT, relief="flat",
+                  font=("Helvetica", 8), padx=6, pady=1
+                  ).pack(side="left", padx=2)
+        tk.Button(xr_btns, text="200–2000", command=lambda: self._x_set(200, 2000),
+                  bg=ACCENT, fg=TEXT, relief="flat",
+                  font=("Helvetica", 8), padx=6, pady=1
+                  ).pack(side="left", padx=2)
+
         # ── Peak Detection ────────────────────────────────────────────────────
         section("Peak Detection")
         row("Show peaks", lambda f: ttk.Checkbutton(f, variable=self.showpeaks_var,
@@ -233,6 +295,11 @@ class RamanApp:
         self.showroi_var = tk.BooleanVar(value=False)
         row("Show ROI profile", lambda f: ttk.Checkbutton(f, variable=self.showroi_var,
                                                            command=self._replot))
+
+    def _build_match_panel(self, parent):
+        # Container that is hidden initially; on_match_toggle packs it.
+        self.match_panel = MatchPanel(parent, self, width=300)
+        # Not packed yet — first toggle reveals it.
 
     def _build_plot(self, parent):
         plot_frame = tk.Frame(parent, bg=BG)
@@ -295,6 +362,8 @@ class RamanApp:
                     self.calibration = cal
                 if blank is not None:
                     self.blank_signal = blank
+                self._loaded_x = None
+                self._loaded_x_label = ""
             elif lower_path.endswith(".rspc"):
                 signal, cal, blank, config = fileio.load_rspc(path)
                 self.raw_signal = signal
@@ -302,14 +371,19 @@ class RamanApp:
                     self.calibration = cal
                 if blank is not None:
                     self.blank_signal = blank
+                self._loaded_x = None
+                self._loaded_x_label = ""
             else:
                 x, y, xl, yl = fileio.load_csv(path)
                 self.raw_signal = y
-                self.x_axis = x
-                self.x_label = xl
+                self._loaded_x = np.asarray(x, dtype=float).copy()
+                self._loaded_x_label = xl
+                if "cm" in xl.lower() or "raman" in xl.lower() or "shift" in xl.lower():
+                    self.axis_var.set("Raman Shifts")
             self._current_file = path
             self._update_axis()
             self._replot()
+            self._refresh_calibration_health()
             self._set_status(f"Opened: {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("Open Error", str(e))
@@ -375,9 +449,21 @@ class RamanApp:
             if self.camera:
                 self.camera.release()
             self.camera = Camera(type=cam_type, index=cam_idx)
+            try:
+                cam_cal = self.camera.get_calibration()
+            except Exception as cal_err:
+                cam_cal = None
+                print(f"Could not load OpenRAMAN calibration from camera: {cal_err}")
+            if cam_cal:
+                self.calibration = cam_cal
+                fileio.save_calibration(cam_cal)
+                self.axis_var.set("Raman Shifts")
             self.camera.set_roi(self.roi_var.get())
             self.btn_connect.config(text="✓ Connected", fg="#00ff88")
-            self._set_status(f"Connected: {self.camera.uid}  |  {self.camera.width}×{self.camera.height}px")
+            cal_msg = "camera calibration loaded" if cam_cal else "using local/no calibration"
+            self._set_status(
+                f"Connected: {self.camera.uid}  |  {self.camera.width}×{self.camera.height}px  |  {cal_msg}"
+            )
         except CameraError as e:
             messagebox.showerror("Camera Error", str(e))
 
@@ -394,8 +480,11 @@ class RamanApp:
             self.raw_signal = accumulated / n
             self._sat_signal = sat
             self._roi_signal = roi
+            self._loaded_x = None
+            self._loaded_x_label = ""
             self._update_axis()
             self._replot()
+            self._refresh_calibration_health()
             self._set_status(f"Captured ({n} avg)  |  {len(self.raw_signal)} pixels")
         except Exception as e:
             messagebox.showerror("Acquisition Error", str(e))
@@ -441,15 +530,155 @@ class RamanApp:
         self._replot()
 
     def on_calibrate(self):
-        CalibrationDialog(self.root, self.raw_signal, self._on_calibration_solution)
+        try:
+            laser_nm = float(self.laser_var.get())
+        except Exception:
+            laser_nm = 532.0
+        CalibrationDialog(
+            self.root,
+            self.raw_signal,
+            self._on_calibration_solution,
+            on_load_camera=self._hard_load_calibration_from_camera,
+            on_copy_to_camera=self._hard_copy_calibration_to_camera,
+            laser_nm=laser_nm,
+        )
+
+    def on_quick_calibrate(self):
+        """One-click calibration from a known sample (e.g. pure IPA)."""
+        if self.raw_signal is None or len(self.raw_signal) == 0:
+            messagebox.showinfo(
+                "No spectrum",
+                "Capture a clean spectrum of a pure liquid first "
+                "(IPA, ethanol, cyclohexane, etc.), then click Quick Cal."
+            )
+            return
+        try:
+            laser_nm = float(self.laser_var.get())
+        except Exception:
+            laser_nm = 532.0
+        SampleCalibrationDialog(
+            self.root,
+            self.raw_signal,
+            self._on_calibration_solution,
+            laser_nm=laser_nm,
+            current_coeffs=self.calibration,
+        )
 
     def _on_calibration_solution(self, coeffs):
+        self._apply_calibration_coeffs(
+            coeffs,
+            "Calibration applied locally. Calibration lamp frame cleared; capture the sample again.",
+            clear_current_spectrum=True,
+        )
+
+    def _apply_calibration_coeffs(self, coeffs, msg, clear_current_spectrum=False):
         self.calibration = list(coeffs)
         fileio.save_calibration(coeffs)
         self.axis_var.set("Raman Shifts")
-        self._set_status(f"Calibration applied and saved. Axis set to Raman Shifts.")
-        self._update_axis()
-        self._replot()
+        if clear_current_spectrum:
+            self._clear_current_spectrum()
+        else:
+            self._update_axis()
+            self._replot()
+            self._refresh_calibration_health()
+        self._set_status(msg)
+
+    def _clear_current_spectrum(self):
+        self.raw_signal = None
+        self.x_axis = None
+        self._loaded_x = None
+        self._loaded_x_label = ""
+        self._current_file = ""
+        self._sat_signal = None
+        self._roi_signal = None
+        self.ax.cla()
+        self._style_axes(self.ax)
+        self.ax.set_xlabel("Raman Shift (cm⁻¹)", color=TEXT, fontsize=9)
+        self.ax.set_ylabel("Intensity (a.u.)", color=TEXT, fontsize=9)
+        self.ax.set_title("Raman Spectrum", color=CYAN, fontsize=10, fontweight="bold")
+        self.ax.text(
+            0.5,
+            0.5,
+            "Calibration applied. Capture a sample spectrum.",
+            transform=self.ax.transAxes,
+            fontsize=10,
+            color=TEXT,
+            ha="center",
+            va="center",
+        )
+        self.canvas.draw_idle()
+
+    def _hard_load_calibration_from_camera(self):
+        if self.camera is None:
+            raise RuntimeError("Connect the camera first.")
+        if not hasattr(self.camera, "get_calibration"):
+            raise RuntimeError("This camera backend cannot read OpenRAMAN calibration memory.")
+        coeffs = self.camera.get_calibration()
+        self._apply_calibration_coeffs(
+            coeffs,
+            "Hard-loaded OpenRAMAN calibration from camera."
+        )
+        return coeffs
+
+    def _hard_copy_calibration_to_camera(self):
+        if self.camera is None:
+            raise RuntimeError("Connect the camera first.")
+        if self.calibration is None:
+            raise RuntimeError("No local calibration is available to copy.")
+        if not hasattr(self.camera, "set_calibration"):
+            raise RuntimeError("This camera backend cannot write OpenRAMAN calibration memory.")
+        self.camera.set_calibration(self.calibration)
+        self._set_status("Hard-copied current calibration into camera memory.")
+        return list(self.calibration)
+
+    def on_match_toggle(self):
+        if self.match_panel.winfo_ismapped():
+            self.match_panel.pack_forget()
+            self.btn_match.configure(fg="#a3ffd9")
+        else:
+            self.match_panel.pack(side="right", fill="y", padx=(0, 6), pady=6)
+            self.btn_match.configure(fg=CYAN)
+            # If we already have a spectrum, kick off a match immediately.
+            if self.raw_signal is not None:
+                self.match_panel.run_match()
+
+    def query_for_matching(self):
+        """
+        Return (cm_x, processed_y) for the current spectrum in cm⁻¹ space,
+        or (None, None) if matching isn't possible.
+
+        Two routes get you cm⁻¹:
+          1. A loaded file (CSV / RRUFF) that already supplies cm⁻¹ data.
+          2. A camera capture with calibration + laser wavelength set.
+        """
+        if self.raw_signal is None:
+            return None, None
+
+        # Route 1: file supplied an x-axis that looks like Raman shifts.
+        if self._loaded_x is not None and len(self._loaded_x) == len(self.raw_signal):
+            x = self._loaded_x
+            xmin, xmax = float(np.min(x)), float(np.max(x))
+            looks_like_cm = (
+                xmin > 30 and xmax < 6000 and (xmax - xmin) > 200
+                and ("cm" in self._loaded_x_label.lower()
+                     or "raman" in self._loaded_x_label.lower()
+                     or "shift" in self._loaded_x_label.lower()
+                     or xmin > 80)  # heuristic: pixels start at 0
+            )
+            if looks_like_cm:
+                return x, self._processed_signal()
+
+        # Route 2: calibrated pixel axis → cm⁻¹ via laser.
+        if self.calibration is None:
+            return None, None
+        n = len(self.raw_signal)
+        wl = dsp.pixels_to_wavelengths(self.calibration, n)
+        try:
+            laser = float(self.laser_var.get())
+        except Exception:
+            laser = 532.0
+        cm = dsp.wavelengths_to_raman(wl, laser)
+        return cm, self._processed_signal()
 
     def on_params_toggle(self):
         if self.sidebar.winfo_ismapped():
@@ -468,9 +697,72 @@ class RamanApp:
     # Camera callbacks
     # ═══════════════════════════════════════════════════════════════════════════
 
+    # ── Exposure (log-scaled slider + free-form entry) ────────────────────
+    # Slider position 0..1000 maps logarithmically to 1 ms..60 s. The entry
+    # box is unbounded so the user can type longer exposures directly.
+    _EXP_MIN_SEC = 0.001
+    _EXP_MAX_SEC = 60.0
+
+    def _sec_to_slider(self, sec):
+        import math
+        sec = max(self._EXP_MIN_SEC, min(self._EXP_MAX_SEC, float(sec)))
+        lo, hi = math.log10(self._EXP_MIN_SEC), math.log10(self._EXP_MAX_SEC)
+        return 1000.0 * (math.log10(sec) - lo) / (hi - lo)
+
+    def _slider_to_sec(self, pos):
+        import math
+        lo, hi = math.log10(self._EXP_MIN_SEC), math.log10(self._EXP_MAX_SEC)
+        return 10.0 ** (lo + (float(pos) / 1000.0) * (hi - lo))
+
     def _on_exposure(self, v):
         if self.camera:
             self.camera.set_exposure(v)
+
+    def _on_exposure_slider(self, pos):
+        if self._exp_syncing:
+            return
+        sec = self._slider_to_sec(pos)
+        # Snap to sensible precision so the entry doesn't show 13 digits.
+        if sec < 0.01:
+            sec = round(sec, 4)
+        elif sec < 1.0:
+            sec = round(sec, 3)
+        else:
+            sec = round(sec, 2)
+        self._exp_syncing = True
+        try:
+            self.exposure_var.set(sec)
+        finally:
+            self._exp_syncing = False
+        self._apply_exposure(sec)
+
+    def _on_exposure_entry(self, *_):
+        if self._exp_syncing:
+            return
+        try:
+            sec = float(self.exposure_var.get())
+        except (TypeError, ValueError):
+            return
+        if sec <= 0:
+            return
+        # Push back onto the slider (clamped to 1ms-60s display range);
+        # if user typed >60s the slider sits at max but the entry value wins.
+        self._exp_syncing = True
+        try:
+            self._exp_slider_var.set(self._sec_to_slider(sec))
+        finally:
+            self._exp_syncing = False
+        self._apply_exposure(sec)
+
+    def _apply_exposure(self, sec):
+        if sec < 1.0:
+            txt = f"{sec*1000:.1f} ms"
+        elif sec < 60.0:
+            txt = f"{sec:.2f} s"
+        else:
+            txt = f"{sec/60.0:.2f} min"
+        self.exposure_label.config(text=txt)
+        self._on_exposure(sec)
 
     def _on_gain(self, v):
         if self.camera:
@@ -489,6 +781,14 @@ class RamanApp:
             return
         n = len(self.raw_signal)
         ax_type = self.axis_var.get()
+
+        # A CSV / RRUFF file that ships its own x-axis wins over calibration:
+        # the file's units are authoritative, and re-deriving from pixels
+        # would be wrong if the file isn't pixel-indexed.
+        if self._loaded_x is not None and len(self._loaded_x) == n:
+            self.x_axis = self._loaded_x
+            self.x_label = self._loaded_x_label or "x"
+            return
 
         if ax_type == "Pixels" or self.calibration is None:
             self.x_axis  = np.arange(n, dtype=float)
@@ -524,6 +824,9 @@ class RamanApp:
         # Main spectrum
         self.ax.plot(x, y_proc, color=CYAN, linewidth=1.2, label="Spectrum")
 
+        # Match overlay (reference spectrum, scaled to fit)
+        self._draw_match_overlay(x, y_proc)
+
         # Saturation overlay
         if self.showsat_var.get() and hasattr(self, "_sat_signal") and self._sat_signal is not None:
             s = self._sat_signal
@@ -554,7 +857,158 @@ class RamanApp:
             self.ax.text(0.01, 0.97, "● Blank subtracted", transform=self.ax.transAxes,
                          fontsize=7, color="#ffaa44", va="top")
 
+        # Non-monotonic calibration detector — when the cm⁻¹/wavelength axis
+        # folds back on itself the plot appears to have "two values per x".
+        # Surface that to the user instead of letting them puzzle over it.
+        if self.x_axis is not None and len(self.x_axis) > 2:
+            d = np.diff(self.x_axis)
+            if not (np.all(d > 0) or np.all(d < 0)):
+                self.ax.text(0.5, 0.97,
+                             "⚠ Non-monotonic calibration — plot folds back. "
+                             "Re-calibrate (try Linear model).",
+                             transform=self.ax.transAxes, fontsize=9,
+                             color="#ff6b6b", ha="center", va="top",
+                             bbox=dict(facecolor=PLOT_BG, edgecolor="#ff6b6b",
+                                       boxstyle="round,pad=0.3"))
+            elif self.x_label == "Raman Shift (cm⁻¹)":
+                finite_x = self.x_axis[np.isfinite(self.x_axis)]
+                if finite_x.size:
+                    cm_min = float(np.min(finite_x))
+                    cm_max = float(np.max(finite_x))
+                    if cm_min > 650 or cm_max < 3400:
+                        self.ax.text(0.5, 0.92,
+                                     f"⚠ Calibration covers {cm_min:.0f}–{cm_max:.0f} cm⁻¹; "
+                                     "expected roughly 500–3500.",
+                                     transform=self.ax.transAxes, fontsize=8,
+                                     color="#ffaa44", ha="center", va="top",
+                                     bbox=dict(facecolor=PLOT_BG, edgecolor="#ffaa44",
+                                               boxstyle="round,pad=0.25"))
+                lamp_name, lamp_count = self._calibration_lamp_signature(x, y_proc)
+                if lamp_count >= 4:
+                    self.ax.text(0.5, 0.86,
+                                 f"⚠ {lamp_name} calibration-line pattern detected. "
+                                 "Remove/turn off the calibration source and capture the sample again.",
+                                 transform=self.ax.transAxes, fontsize=8,
+                                 color="#ff6b6b", ha="center", va="top",
+                                 bbox=dict(facecolor=PLOT_BG, edgecolor="#ff6b6b",
+                                           boxstyle="round,pad=0.25"))
+
+        # IR-style convention: when plotting in wavenumbers (Raman shift or
+        # absolute), high values on the left, low on the right.
+        if self.x_label == "Raman Shift (cm⁻¹)":
+            self.ax.invert_xaxis()
+
+        # Manual X-range override
+        self._apply_xrange()
+
         self.canvas.draw_idle()
+
+    def _apply_xrange(self):
+        """Apply manual X-limits from the sidebar entries, if both are numeric."""
+        try:
+            lo = float(self.xmin_var.get())
+            hi = float(self.xmax_var.get())
+        except (ValueError, AttributeError):
+            if self.x_label == "Raman Shift (cm⁻¹)":
+                self.ax.set_xlim(3500, 500)
+            return
+        if lo == hi:
+            return
+        # If axis was inverted (cm⁻¹), set_xlim with hi first preserves that.
+        if self.x_label == "Raman Shift (cm⁻¹)":
+            self.ax.set_xlim(max(lo, hi), min(lo, hi))
+        else:
+            self.ax.set_xlim(min(lo, hi), max(lo, hi))
+
+    def _x_auto(self):
+        self.xmin_var.set("")
+        self.xmax_var.set("")
+        self._replot()
+
+    def _x_set(self, lo, hi):
+        self.xmin_var.set(str(lo))
+        self.xmax_var.set(str(hi))
+        self._replot()
+
+    def _draw_match_overlay(self, x, y_proc):
+        """Overlay one or more reference spectra.
+
+        References live on a fixed cm⁻¹ grid and are L2-normalized; each is
+        scaled to the sample's visible amplitude before plotting. Overlays
+        are only drawn on the Raman-shift axis — that's the only axis where
+        the comparison is meaningful.
+        """
+        if not hasattr(self, "match_panel") or not self.match_panel.winfo_ismapped():
+            return
+        refs = self.match_panel.selected_references()
+        if not refs:
+            return
+        if self.x_label != "Raman Shift (cm⁻¹)":
+            self.ax.text(0.99, 0.97,
+                         "Switch X-axis to Raman Shifts to see overlay",
+                         transform=self.ax.transAxes, fontsize=8,
+                         color="#ffaa44", ha="right", va="top")
+            return
+
+        y_visible = y_proc[np.isfinite(y_proc)]
+        if y_visible.size == 0:
+            return
+        peak = float(np.max(y_visible))
+        if peak <= 0:
+            return
+
+        for _, meta, y_ref, grid, color in refs:
+            ref_peak = float(np.max(y_ref)) or 1.0
+            y_scaled = y_ref * (peak / ref_peak) * 0.9
+            self.ax.plot(grid, y_scaled, color=color, linewidth=0.9,
+                         alpha=0.7, label=f"Ref: {meta.display()}")
+        self.ax.legend(loc="upper right", facecolor=PLOT_BG, edgecolor=GRID_COL,
+                       labelcolor=TEXT, fontsize=8)
+
+    def _calibration_lamp_signature(self, x, y_proc):
+        """Return (source name, matched line count) for lamp-like spectra."""
+        if self.x_label == "Wavelength (nm)":
+            wavelengths = np.asarray(x, dtype=float)
+        elif self.x_label == "Raman Shift (cm⁻¹)":
+            try:
+                laser = float(self.laser_var.get())
+            except Exception:
+                laser = 532.0
+            shifts = np.asarray(x, dtype=float)
+            denom = (1.0 / laser) - (shifts / 1.0e7)
+            wavelengths = np.full(shifts.shape, np.nan, dtype=float)
+            good = denom > 0
+            wavelengths[good] = 1.0 / denom[good]
+        else:
+            return "", 0
+
+        if wavelengths.size != len(y_proc):
+            return "", 0
+        peaks = dsp.detect_peaks(
+            y_proc,
+            prominence=self.peak_prom_var.get(),
+            distance=self.peak_dist_var.get(),
+            n_peaks=25,
+        )
+        if len(peaks) < 4:
+            return "", 0
+
+        peak_wavelengths = wavelengths[peaks]
+
+        def count_matches(lines):
+            lines = np.asarray(lines, dtype=float)
+            used = set()
+            for wl in peak_wavelengths[np.isfinite(peak_wavelengths)]:
+                nearest_idx = int(np.argmin(np.abs(lines - wl)))
+                if abs(lines[nearest_idx] - wl) <= 1.2:
+                    used.add(nearest_idx)
+            return len(used)
+
+        neon = count_matches(dsp.NEON_LINES)
+        hgar = count_matches(dsp.MERCURY_ARGON_LINES)
+        if neon >= hgar:
+            return "Neon", neon
+        return "Mercury-Argon", hgar
 
     def _processed_signal(self):
         return dsp.process_spectrum(
@@ -586,8 +1040,45 @@ class RamanApp:
 
     def _set_status(self, msg):
         cam = self.camera.uid if self.camera else "No camera"
-        cal = "Calibrated" if self.calibration else "Uncalibrated"
+        cal = self._calibration_health_label()
         self.status_var.set(f"{msg}  |  {cam}  |  {cal}")
+
+    def _calibration_health_label(self):
+        """Status-bar text for the calibration state.
+
+        When a recent diagnostic is available, surface a one-line hint so the
+        user notices a bad calibration without having to click Match.
+        """
+        if not self.calibration:
+            return "Uncalibrated"
+        health = getattr(self, "_cal_health", None)
+        if health is None:
+            return "Calibrated"
+        if health["verdict"] == "ok":
+            return f"✓ Cal OK (matches {health['name']})"
+        return (f"⚠ Cal off ~{abs(health['offset_cm']):.0f} cm⁻¹ "
+                f"(looks like {health['name']} — try Quick Cal)")
+
+    def _refresh_calibration_health(self):
+        """Recompute the calibration diagnostic from the current spectrum.
+
+        Called whenever raw_signal changes so the status-bar hint stays
+        in sync. Failures are swallowed — the indicator is best-effort.
+        """
+        self._cal_health = None
+        if self.raw_signal is None or not self.calibration:
+            return
+        try:
+            laser = float(self.laser_var.get())
+        except Exception:
+            laser = 532.0
+        try:
+            self._cal_health = dsp.diagnose_calibration(
+                self.raw_signal, self.calibration, laser,
+                n_pixels=len(self.raw_signal),
+            )
+        except Exception:
+            self._cal_health = None
 
 
 # ── Camera picker helper ───────────────────────────────────────────────────────

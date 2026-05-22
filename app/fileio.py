@@ -12,27 +12,42 @@ from . import dsp, openraman_spc
 
 def load_csv(path):
     """
-    Load a two-column CSV (x, y). First row may be a header.
+    Load a two-column CSV/TXT (x, y). First row may be a header.
+
+    Also tolerates RRUFF-style ``##KEY=VALUE`` metadata lines, which are
+    skipped without poisoning the x/y labels. If a ``##NAMES=`` field is
+    present, it becomes the y-axis label so the spectrum is identifiable.
+
     Returns (x_array, y_array, x_label, y_label).
     """
     rows = []
     x_label, y_label = "x", "Intensity"
+    rruff_name = None
+    has_rruff_meta = False
     with open(path, newline='', encoding='utf-8-sig') as f:
         reader = csv.reader(f)
         for row in reader:
             if not row:
                 continue
+            first = row[0].strip()
+            if first.startswith("##"):
+                has_rruff_meta = True
+                if first.upper().startswith("##NAMES="):
+                    rruff_name = first.split("=", 1)[1].strip()
+                continue
             try:
-                x = float(row[0].strip())
+                x = float(first)
                 y = float(row[1].strip())
                 rows.append((x, y))
             except (ValueError, IndexError):
-                # header row
-                if len(row) >= 2:
-                    x_label = row[0].strip()
+                if len(row) >= 2 and not has_rruff_meta:
+                    x_label = first
                     y_label = row[1].strip()
     if not rows:
         raise ValueError("No numeric data found in CSV")
+    if has_rruff_meta:
+        x_label = "Raman Shift (cm⁻¹)"
+        y_label = rruff_name or "Intensity"
     xs, ys = zip(*rows)
     return np.array(xs), np.array(ys), x_label, y_label
 

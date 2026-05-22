@@ -1,4 +1,5 @@
 """Camera acquisition – exclusively supports FLIR/PointGrey (Spinnaker SDK)."""
+import struct
 import threading
 import time
 import numpy as np
@@ -12,6 +13,18 @@ except ImportError:
 
 class CameraError(Exception):
     pass
+
+
+OPENRAMAN_CAL_IDENT = 0xCADA
+OPENRAMAN_CAL_STRUCT = struct.Struct("<HBB4f")
+
+
+def _checksum8(data: bytes) -> int:
+    """OpenRAMAN checksum8: bitwise-not sum followed by bitwise-not."""
+    total = 0
+    for b in data:
+        total = (total + ((~b) & 0xFF)) & 0xFF
+    return (~total) & 0xFF
 
 
 def list_cameras():
@@ -53,22 +66,50 @@ class FlirCamera:
         
         self._cam = self._cam_list.GetByIndex(index)
         self._cam.Init()
+        self._load_user_set2()
         
         # Set pixel format to Mono8 or Mono12/16 if possible
         nodemap = self._cam.GetNodeMap()
         pixel_format = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
         if PySpin.IsAvailable(pixel_format) and PySpin.IsWritable(pixel_format):
-            for fmt in ["Mono12", "Mono16", "Mono8"]:
+            for fmt in ["Mono16", "Mono12", "Mono8"]:
                 entry = pixel_format.GetEntryByName(fmt)
                 if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
                     pixel_format.SetIntValue(entry.GetValue())
                     break
+        self._set_bool_node("ReverseX", True)
 
         self._cam.BeginAcquisition()
         self._exposure = 0.1
         self._gain = 0.0
         self._roi_rows = None
         self._lock = threading.Lock()
+
+    def _load_user_set2(self):
+        nodemap = self._cam.GetNodeMap()
+        selector = PySpin.CEnumerationPtr(nodemap.GetNode("UserSetSelector"))
+        load = PySpin.CCommandPtr(nodemap.GetNode("UserSetLoad"))
+        if not (PySpin.IsAvailable(selector) and PySpin.IsWritable(selector)):
+            return
+        if not (PySpin.IsAvailable(load) and PySpin.IsWritable(load)):
+            return
+        entry = selector.GetEntryByName("UserSet2")
+        if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+            selector.SetIntValue(entry.GetValue())
+            load.Execute()
+
+    def _save_user_set2(self):
+        nodemap = self._cam.GetNodeMap()
+        selector = PySpin.CEnumerationPtr(nodemap.GetNode("UserSetSelector"))
+        save = PySpin.CCommandPtr(nodemap.GetNode("UserSetSave"))
+        if not (PySpin.IsAvailable(selector) and PySpin.IsWritable(selector)):
+            return
+        if not (PySpin.IsAvailable(save) and PySpin.IsWritable(save)):
+            return
+        entry = selector.GetEntryByName("UserSet2")
+        if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+            selector.SetIntValue(entry.GetValue())
+            save.Execute()
 
     @property
     def uid(self):
@@ -118,6 +159,111 @@ class FlirCamera:
 
     def get_roi(self):
         return self._roi_rows if self._roi_rows else self.height
+
+    def _set_bool_node(self, name, value):
+        nodemap = self._cam.GetNodeMap()
+        node = PySpin.CBooleanPtr(nodemap.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+            node.SetValue(bool(value))
+
+    def _user_value_nodes(self, write=False):
+        nodemap = self._cam.GetNodeMap()
+        selector = PySpin.CEnumerationPtr(nodemap.GetNode("UserDefinedValueSelector"))
+        value = PySpin.CIntegerPtr(nodemap.GetNode("UserDefinedValue"))
+        if not (PySpin.IsAvailable(selector) and PySpin.IsReadable(selector) and PySpin.IsWritable(selector)):
+            raise CameraError("Camera does not expose UserDefinedValueSelector.")
+        if not (PySpin.IsAvailable(value) and PySpin.IsReadable(value)):
+            raise CameraError("Camera does not expose UserDefinedValue.")
+        if write and not PySpin.IsWritable(value):
+            raise CameraError("Camera UserDefinedValue is not writable.")
+        return selector, value
+
+    def _user_value_count(self, selector):
+        entries = selector.GetEntries()
+        if hasattr(entries, "GetSize"):
+            iterable = [entries.GetByIndex(i) for i in range(entries.GetSize())]
+        else:
+            iterable = list(entries)
+        count = 0
+        for entry in iterable:
+            if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+                count += 1
+        return count
+
+    def _read_user_data(self, n_bytes):
+        selector, value = self._user_value_nodes(write=False)
+        count = self._user_value_count(selector)
+        if n_bytes > count * 4:
+            raise CameraError("Camera does not have enough user data slots.")
+
+        out = bytearray()
+        old = selector.GetIntValue()
+        try:
+            index = 0
+            while len(out) < n_bytes:
+                selector.SetIntValue(index)
+                word = int(value.GetValue()) & 0xFFFFFFFF
+                out.extend(struct.pack("<I", word))
+                index += 1
+        finally:
+            selector.SetIntValue(old)
+        return bytes(out[:n_bytes])
+
+    def _write_user_data(self, data):
+        selector, value = self._user_value_nodes(write=True)
+        count = self._user_value_count(selector)
+        if len(data) > count * 4:
+            raise CameraError("Camera does not have enough user data slots.")
+
+        old = selector.GetIntValue()
+        try:
+            for index in range((len(data) + 3) // 4):
+                chunk = data[index * 4:(index + 1) * 4].ljust(4, b"\0")
+                selector.SetIntValue(index)
+                word = struct.unpack("<I", chunk)[0]
+                if word >= 0x80000000:
+                    word -= 0x100000000
+                value.SetValue(word)
+        finally:
+            selector.SetIntValue(old)
+
+    def _with_acquisition_paused(self, fn):
+        with self._lock:
+            was_streaming = self._cam.IsStreaming()
+            if was_streaming:
+                self._cam.EndAcquisition()
+            try:
+                return fn()
+            finally:
+                if was_streaming:
+                    self._cam.BeginAcquisition()
+
+    def get_calibration(self):
+        """Read OpenRAMAN calibration coefficients from camera user memory."""
+        def read():
+            raw = bytearray(self._read_user_data(OPENRAMAN_CAL_STRUCT.size))
+            ident, checksum, _reserved, *coeffs = OPENRAMAN_CAL_STRUCT.unpack(raw)
+            if ident != OPENRAMAN_CAL_IDENT:
+                raise CameraError("No OpenRAMAN calibration found in camera.")
+            raw[2] = 0
+            if checksum != _checksum8(raw):
+                raise CameraError("Camera OpenRAMAN calibration checksum failed.")
+            return [float(c) for c in coeffs]
+
+        return self._with_acquisition_paused(read)
+
+    def set_calibration(self, coeffs):
+        """Write OpenRAMAN calibration coefficients to camera user memory."""
+        def write():
+            values = list(coeffs) + [0.0] * (4 - len(coeffs))
+            raw = bytearray(OPENRAMAN_CAL_STRUCT.pack(
+                OPENRAMAN_CAL_IDENT, 0, 0, *[float(c) for c in values[:4]]
+            ))
+            raw[2] = _checksum8(raw)
+            self._write_user_data(bytes(raw))
+            self._save_user_set2()
+
+        self._with_acquisition_paused(write)
 
     def grab_frame(self):
         with self._lock:

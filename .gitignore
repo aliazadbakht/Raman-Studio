@@ -2,4 +2,12 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+.claude/
+.vscode/
 calibration.json
+
+# Reference library — keep the curated starter set, ignore the
+# (potentially huge) downloaded bundles and the compiled cache.
+references/*
+!references/builtin/
+references/library_cache.npz
