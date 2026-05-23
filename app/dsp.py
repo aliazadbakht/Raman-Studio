@@ -90,6 +90,36 @@ def wavelengths_to_raman(wavelengths, laser_nm):
     return 1e7 * (1.0 / laser_nm - 1.0 / wavelengths)
 
 
+def is_default_calibration_axis(coeffs, laser_nm=532.0, cm_min=500.0, cm_max=3500.0,
+                                tolerance_nm=0.05):
+    """
+    Detect the synthetic "set the axis to round cm⁻¹ endpoints" placeholder.
+
+    Such a calibration is not the result of a measurement: it's the linear
+    Legendre fit whose detector endpoints map exactly to ``cm_min`` and
+    ``cm_max`` at the configured ``laser_nm``. Spectra plotted under it look
+    calibrated, but every peak is in the wrong place because the cal has no
+    knowledge of the real grating / detector geometry. The status bar uses
+    this to warn instead of silently telling the user they're calibrated.
+    """
+    if coeffs is None:
+        return False
+    c = list(coeffs) + [0.0] * (4 - len(coeffs))
+    c = c[:4]
+    if abs(c[2]) > 1.0e-3 or abs(c[3]) > 1.0e-3:
+        return False
+    laser = float(laser_nm)
+    try:
+        wl_left = 1.0 / (1.0 / laser - float(cm_min) / 1.0e7)
+        wl_right = 1.0 / (1.0 / laser - float(cm_max) / 1.0e7)
+    except ZeroDivisionError:
+        return False
+    c0_target = 0.5 * (wl_left + wl_right)
+    c1_target = 0.5 * (wl_right - wl_left)
+    return (abs(float(c[0]) - c0_target) < tolerance_nm
+            and abs(float(c[1]) - c1_target) < tolerance_nm)
+
+
 def fit_calibration(pixel_positions, known_wavelengths, degree=3, n_pixels=None):
     """
     Fit OpenRAMAN-compatible Legendre calibration coefficients.
@@ -119,7 +149,8 @@ def calibration_source_rms(coeffs, peak_positions, source_wavelengths, n_pixels=
     if not projected.size or not source.size:
         return 0.0
     _, residuals = assign_source_lines(projected, source)
-    return float(np.sqrt(np.mean(residuals ** 2))) if residuals.size else 0.0
+    finite = residuals[np.isfinite(residuals)]
+    return float(np.sqrt(np.mean(finite ** 2))) if finite.size else 0.0
 
 
 def closest_source_lines(coeffs, peak_positions, source_wavelengths, n_pixels=None):
@@ -133,7 +164,8 @@ def closest_source_lines(coeffs, peak_positions, source_wavelengths, n_pixels=No
     return projected, assigned
 
 
-def assign_source_lines(projected_wavelengths, source_wavelengths):
+def assign_source_lines(projected_wavelengths, source_wavelengths,
+                        max_residual=None):
     """
     Assign projected peak wavelengths to source lines one-to-one.
 
@@ -141,6 +173,19 @@ def assign_source_lines(projected_wavelengths, source_wavelengths):
     line, which makes ordinary sample spectra look deceptively calibratable.
     A calibration lamp has at most one detector peak for each source line, so
     automatic fitting should use unique line assignments.
+
+    Args:
+        max_residual: if given, peaks farther than this many nm from any source
+            line are left unassigned (nan / inf) instead of being force-paired
+            to a distant line. This is critical when a real lamp peak and a
+            noise peak land near the same source line: without an "unassigned"
+            escape valve, Hungarian cascades every downstream pairing by one
+            (every real peak gets bumped to the next source line over), which
+            looks catastrophic to the cost function even at the true cal.
+
+    Without ``max_residual`` (the default), behaviour is the legacy one-to-one
+    Hungarian assignment, with one fix: ``projected.size > source.size`` no
+    longer raises — surplus peaks remain unassigned instead.
     """
     projected = np.asarray(projected_wavelengths, dtype=float)
     source = np.asarray(source_wavelengths, dtype=float)
@@ -148,18 +193,41 @@ def assign_source_lines(projected_wavelengths, source_wavelengths):
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
     if source.size == 0:
         return np.full(projected.shape, np.nan), np.full(projected.shape, np.inf)
-    if projected.size > source.size:
-        raise ValueError(
-            "Detected more calibration peaks than known source lines. "
-            "Reduce Max Peaks or lower the peak sensitivity."
-        )
 
-    costs = np.abs(projected[:, None] - source[None, :])
-    row_idx, col_idx = linear_sum_assignment(costs)
+    n_p = int(projected.size)
+    n_s = int(source.size)
+
+    if max_residual is not None:
+        # Hungarian with ``n_p`` dummy columns at cost ``max_residual``. Each
+        # peak picks the cheaper of: a real source line at its true residual,
+        # or a dummy at flat cost. A peak farther than ``max_residual`` from
+        # every line picks a dummy and is reported unassigned — preserving
+        # the real-peak assignments intact.
+        cost_real = np.abs(projected[:, None] - source[None, :])
+        dummy = np.full((n_p, n_p), float(max_residual))
+        full_cost = np.column_stack([cost_real, dummy])
+        row_idx, col_idx = linear_sum_assignment(full_cost)
+        assigned = np.full(n_p, np.nan, dtype=float)
+        residuals = np.full(n_p, np.inf, dtype=float)
+        for r, c in zip(row_idx, col_idx):
+            if c < n_s:
+                assigned[r] = source[c]
+                residuals[r] = projected[r] - source[c]
+        return assigned, residuals
+
     assigned = np.full(projected.shape, np.nan, dtype=float)
     residuals = np.full(projected.shape, np.inf, dtype=float)
-    assigned[row_idx] = source[col_idx]
-    residuals[row_idx] = projected[row_idx] - source[col_idx]
+
+    if n_p <= n_s:
+        costs = np.abs(projected[:, None] - source[None, :])
+        row_idx, col_idx = linear_sum_assignment(costs)
+        assigned[row_idx] = source[col_idx]
+        residuals[row_idx] = projected[row_idx] - source[col_idx]
+    else:
+        costs = np.abs(source[:, None] - projected[None, :])
+        src_idx, proj_idx = linear_sum_assignment(costs)
+        assigned[proj_idx] = source[src_idx]
+        residuals[proj_idx] = projected[proj_idx] - source[src_idx]
     return assigned, residuals
 
 
@@ -168,56 +236,79 @@ def match_peaks_to_standard(detected_pixels, current_coeffs, expected_shifts,
     """
     Pair detected sample peaks with the closest expected Raman shifts.
 
-    The user's *current* (possibly bad) calibration is used to project each
-    detected pixel to an approximate cm⁻¹. We then find a global cm⁻¹ offset
-    that aligns the detected peak pattern with the expected one, and assign
-    pairs by Hungarian matching with that offset applied.
+    Robust against BOTH wavelength offset (wrong c0) and wavelength scale
+    (wrong c1) errors in the current calibration. A single-cm⁻¹-offset search
+    cannot compensate the latter: a constant wavelength offset becomes a
+    non-constant cm⁻¹ shift (smaller at low cm⁻¹, larger at high cm⁻¹), so
+    Hungarian then prefers whichever subset of detected peaks happens to
+    align with the average shift — frequently the noise peaks, not the real
+    sample peaks.
+
+    The fix is to enumerate ordered subsets of (detected, expected) pairs
+    and fit a linear wavelength calibration (wl = a + b·t) for each. The
+    subset with smallest RMS in wavelength space wins. This works without
+    relying on the current calibration at all; ``current_coeffs`` and
+    ``search_window_cm`` are kept in the signature for backwards
+    compatibility but are no longer used.
 
     Returns: list of (pixel, expected_shift_cm) tuples, ordered by pixel.
-    Robust to extra detected peaks or missing expected peaks (no pair is
-    forced if the residual exceeds the per-pair tolerance).
     """
-    detected = np.asarray(detected_pixels, dtype=float)
-    expected = np.asarray(sorted(expected_shifts), dtype=float)
+    from itertools import combinations
+
+    del current_coeffs, search_window_cm  # no longer used; preserved for API
+
+    detected = np.sort(np.asarray(detected_pixels, dtype=float))
+    expected = np.sort(np.asarray(expected_shifts, dtype=float))
     if detected.size == 0 or expected.size == 0:
         return []
 
-    t = normalize_pixels(detected, n_pixels=n_pixels)
-    wl = legendre.legval(t, np.asarray(current_coeffs, dtype=float))
-    current_cm = wavelengths_to_raman(wl, float(laser_nm))
+    laser = float(laser_nm)
+    expected_wl = 1.0 / (1.0 / laser - expected / 1.0e7)
+    n_det = int(detected.size)
+    n_exp = int(expected.size)
+    max_M = min(n_det, n_exp, 8)
+    min_M = 3 if min(n_det, n_exp) >= 3 else 2
+    if max_M < min_M:
+        return []
 
-    # Coarse 1-D search for the best global shift between detected and expected.
-    shifts = np.linspace(-search_window_cm, search_window_cm, 161)
-    best_shift = 0.0
-    best_cost = np.inf
-    for s in shifts:
-        d = current_cm + s
-        # Sum of distances from each detected peak to its nearest expected peak.
-        cost = float(np.sum(np.min(np.abs(d[:, None] - expected[None, :]), axis=1)))
-        if cost < best_cost:
-            best_cost = cost
-            best_shift = float(s)
+    t_all = normalize_pixels(detected, n_pixels=n_pixels)
 
-    shifted = current_cm + best_shift
+    best_score = -np.inf
+    best_pairs = []
 
-    # One-to-one Hungarian assignment. Costs above tolerance get dropped.
-    n_d, n_e = len(shifted), len(expected)
-    if n_d <= n_e:
-        cost_mat = np.abs(shifted[:, None] - expected[None, :])
-        rows, cols = linear_sum_assignment(cost_mat)
-        pairs_idx = [(int(r), int(c)) for r, c in zip(rows, cols)]
-    else:
-        cost_mat = np.abs(shifted[:, None] - expected[None, :]).T  # transpose
-        rows, cols = linear_sum_assignment(cost_mat)
-        pairs_idx = [(int(c), int(r)) for r, c in zip(rows, cols)]
+    for M in range(max_M, min_M - 1, -1):
+        for det_idx in combinations(range(n_det), M):
+            t = t_all[list(det_idx)]
+            A = np.column_stack([np.ones_like(t), t])
+            for exp_idx in combinations(range(n_exp), M):
+                wl_target = expected_wl[list(exp_idx)]
+                try:
+                    coef, *_ = np.linalg.lstsq(A, wl_target, rcond=None)
+                except np.linalg.LinAlgError:
+                    continue
+                a, b = float(coef[0]), float(coef[1])
+                # Sanity: positive dispersion, reasonable visible-range center.
+                if not (5.0 <= b <= 500.0):
+                    continue
+                if not (200.0 <= a <= 1500.0):
+                    continue
+                wl_pred = a + b * t
+                cm_pred = 1.0e7 * (1.0 / laser - 1.0 / wl_pred)
+                exp_sel = expected[list(exp_idx)]
+                res_cm = cm_pred - exp_sel
+                if np.max(np.abs(res_cm)) > 80.0:
+                    continue
+                rms_cm = float(np.sqrt(np.mean(res_cm ** 2)))
+                # Each additional matched peak is worth ~25 cm⁻¹ of allowable
+                # residual — encourages picking 4 tight pairs over 2 perfect
+                # pairs that don't constrain the cal.
+                score = M - rms_cm / 25.0
+                if score > best_score:
+                    best_score = score
+                    best_pairs = [(float(detected[di]), float(expected[ei]))
+                                   for di, ei in zip(det_idx, exp_idx)]
 
-    tol = max(80.0, search_window_cm * 0.35)
-    pairs = []
-    for di, ei in pairs_idx:
-        if abs(shifted[di] - expected[ei]) <= tol:
-            pairs.append((float(detected[di]), float(expected[ei])))
-    pairs.sort(key=lambda p: p[0])
-    return pairs
+    return best_pairs
 
 
 def diagnose_calibration(y, current_coeffs, laser_nm, n_pixels=None,
@@ -304,13 +395,28 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
                               distortion_min=0.0, distortion_max=10.0,
                               sampling=10, random_seed=12345,
                               endpoint_min=None, endpoint_max=None,
-                              endpoint_weight=10.0):
+                              endpoint_weight=10.0,
+                              outlier_threshold_nm=1.0,
+                              refine_iters=4):
     """
     Fit OpenRAMAN Legendre coefficients by matching detected peaks to source lines.
 
     Detected peak indices are projected into wavelength space and the optimizer
     minimizes the distance to a unique line from the selected calibration lamp.
     The user does not have to assign each peak manually.
+
+    Outlier handling:
+      • The global cost function caps per-peak residuals at
+        ``outlier_threshold_nm``. A noise peak that lands ≥ threshold from
+        any source line contributes a constant penalty regardless of its
+        distance — so one cosmic ray cannot drag the polynomial off the
+        real lamp lines.
+      • After the global + local optimization, the fit is refined on the
+        inlier subset (residual < threshold) via direct least-squares for up
+        to ``refine_iters`` rounds. This gets sub-pm RMS on real lamps that
+        come with 1–3 extra spurious peaks.
+      • If more peaks were detected than source lines exist, the surplus
+        peaks remain unassigned and are reported as outliers in the result.
     """
     peaks = np.asarray(peak_positions, dtype=float)
     source = np.asarray(source_wavelengths, dtype=float)
@@ -323,11 +429,6 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
     min_peaks = 2 if degree == 1 else 3
     if peaks.size < min_peaks:
         raise ValueError(f"Need at least {min_peaks} detected peaks for {model} calibration.")
-    if peaks.size > source.size:
-        raise ValueError(
-            "Detected more calibration peaks than known source lines. "
-            "Reduce Max Peaks or lower the peak sensitivity."
-        )
 
     range_min = float(range_min)
     range_max = float(range_max)
@@ -339,6 +440,8 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
     endpoint_weight = float(max(0.0, endpoint_weight))
     endpoint_min = None if endpoint_min is None else float(endpoint_min)
     endpoint_max = None if endpoint_max is None else float(endpoint_max)
+    outlier_threshold_nm = float(max(0.05, outlier_threshold_nm))
+    refine_iters = int(max(0, refine_iters))
 
     if range_min >= range_max:
         raise ValueError("Minimum wavelength range must be smaller than maximum range.")
@@ -384,8 +487,20 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
     def cost(coeffs):
         coeffs4 = as4(coeffs)
         projected = legendre.legval(t, coeffs4)
-        _, residuals = assign_source_lines(projected, source)
-        total = float(np.sum(np.abs(residuals)))
+        # Dummy-column Hungarian lets noise peaks be "unassigned" instead of
+        # cascading every downstream pairing. The cost contribution of an
+        # outlier is the dummy cost (= outlier_threshold_nm), not the runaway
+        # residual it would have under forced one-to-one matching.
+        _, residuals = assign_source_lines(projected, source,
+                                             max_residual=outlier_threshold_nm)
+        abs_res = np.where(np.isfinite(residuals), np.abs(residuals), outlier_threshold_nm)
+        capped = np.minimum(abs_res, outlier_threshold_nm)
+        total = float(np.sum(capped))
+        # Reward solutions that lock peaks tightly to source lines, so the
+        # optimizer prefers "many strong matches + a few outliers" over
+        # "all peaks half-matched on average".
+        strong = float(np.sum(capped < outlier_threshold_nm * 0.5))
+        total -= 0.5 * outlier_threshold_nm * strong
         if endpoint_min is not None:
             total += endpoint_weight * abs(legendre.legval(-1.0, coeffs4) - endpoint_min)
         if endpoint_max is not None:
@@ -423,9 +538,42 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
         raise ValueError("No calibration solution satisfied the wavelength/span constraints.")
 
     coeffs = as4(best)
-    projected, nearest = closest_source_lines(coeffs, peaks, source, n_pixels=n_pixels)
-    residuals = projected - nearest
-    rms = float(np.sqrt(np.mean(residuals ** 2))) if residuals.size else 0.0
+
+    # Iterative inlier refinement. After the global search has locked onto
+    # the correct lamp line for each real peak, drop any peak whose residual
+    # is above threshold and refit on the inliers via direct least-squares.
+    for _ in range(refine_iters):
+        projected = legendre.legval(t, coeffs)
+        assigned_all, residuals = assign_source_lines(
+            projected, source, max_residual=outlier_threshold_nm)
+        inlier_mask = np.isfinite(residuals) & (np.abs(residuals) < outlier_threshold_nm)
+        if int(inlier_mask.sum()) < degree + 1:
+            break
+        try:
+            new_coeffs = fit_calibration(
+                peaks[inlier_mask],
+                assigned_all[inlier_mask],
+                degree=degree,
+                n_pixels=n_pixels,
+            )
+        except Exception:
+            break
+        if np.allclose(new_coeffs, coeffs, atol=1.0e-7):
+            break
+        coeffs = as4(new_coeffs)
+
+    # Final reporting uses the same dummy-column assignment so unassigned
+    # noise peaks show as NaN/inf rather than being force-paired to whatever
+    # source line happens to be closest under a possibly-off projection.
+    t_full = normalize_pixels(peaks, n_pixels=n_pixels)
+    projected = legendre.legval(t_full, coeffs)
+    nearest, residuals = assign_source_lines(projected, source,
+                                               max_residual=outlier_threshold_nm)
+    inlier_mask = np.isfinite(residuals) & (np.abs(residuals) < outlier_threshold_nm)
+    inlier_residuals = residuals[inlier_mask] if np.any(inlier_mask) else np.asarray([])
+    rms = float(np.sqrt(np.mean(residuals[np.isfinite(residuals)] ** 2))) \
+        if np.any(np.isfinite(residuals)) else 0.0
+    rms_inliers = float(np.sqrt(np.mean(inlier_residuals ** 2))) if inlier_residuals.size else 0.0
     finite_nearest = nearest[np.isfinite(nearest)]
     unique_lines = len(np.unique(finite_nearest)) if finite_nearest.size else 0
     line_span = float(np.max(finite_nearest) - np.min(finite_nearest)) if finite_nearest.size else 0.0
@@ -433,11 +581,13 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
     right_endpoint = float(legendre.legval(1.0, coeffs))
     return coeffs, {
         "rms": rms,
+        "rms_inliers": rms_inliers,
         "cost": cost(coeffs),
         "projected": projected,
         "nearest": nearest,
         "residuals": residuals,
-        "max_error": float(np.max(np.abs(residuals))) if residuals.size else 0.0,
+        "max_error": float(np.max(np.abs(residuals[np.isfinite(residuals)]))) \
+            if np.any(np.isfinite(residuals)) else 0.0,
         "unique_lines": unique_lines,
         "line_span": line_span,
         "endpoint_min": endpoint_min,
@@ -445,6 +595,10 @@ def fit_calibration_to_source(peak_positions, source_wavelengths, model="Cubic",
         "left_endpoint": left_endpoint,
         "right_endpoint": right_endpoint,
         "degree": degree,
+        "inlier_mask": inlier_mask,
+        "n_inliers": int(inlier_mask.sum()),
+        "n_outliers": int((~inlier_mask).sum()),
+        "outlier_threshold_nm": outlier_threshold_nm,
     }
 
 

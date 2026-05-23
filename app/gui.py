@@ -70,6 +70,10 @@ class RamanApp:
 
         self._apply_ttk_style()
         self._update_axis()
+        # Reflect the loaded calibration's health (e.g., placeholder warning)
+        # in the status bar from the very first frame, instead of waiting for
+        # the next event to refresh it.
+        self._set_status("Ready")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # UI Construction
@@ -1051,6 +1055,15 @@ class RamanApp:
         """
         if not self.calibration:
             return "Uncalibrated"
+        # A "Set the axis to round cm⁻¹ endpoints" placeholder cal is NOT a
+        # real measurement — every peak appears in the wrong place. Flag it
+        # before showing diagnostic verdicts that would assume a real fit.
+        try:
+            laser = float(self.laser_var.get())
+        except Exception:
+            laser = 532.0
+        if dsp.is_default_calibration_axis(self.calibration, laser_nm=laser):
+            return "⚠ Default 500–3500 axis (placeholder — Quick Cal or 📐 Calibrate to fix)"
         health = getattr(self, "_cal_health", None)
         if health is None:
             return "Calibrated"

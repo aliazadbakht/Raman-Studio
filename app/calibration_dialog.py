@@ -163,17 +163,27 @@ class CalibrationDialog(tk.Toplevel):
         # Peak list
         list_frame = tk.Frame(self, bg=style_bg)
         list_frame.pack(fill="both", expand=True, padx=10, pady=4)
-        tk.Label(list_frame, text="Matched Peaks  (Pixel → Wavelength nm)",
+        tk.Label(list_frame, text="Matched Peaks  (Pixel → Wavelength nm, residual after fit)",
                  bg=style_bg, fg=style_text, font=("Helvetica", 10, "bold")).pack(anchor="w")
 
-        cols = ("pixel", "wavelength")
+        cols = ("pixel", "wavelength", "delta_nm", "delta_cm")
         self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=8)
         self.tree.heading("pixel", text="Pixel")
         self.tree.heading("wavelength", text="Wavelength (nm)")
-        self.tree.column("pixel", width=100, anchor="center")
-        self.tree.column("wavelength", width=160, anchor="center")
+        self.tree.heading("delta_nm", text="Δ (nm)")
+        self.tree.heading("delta_cm", text="Δ (cm⁻¹)")
+        self.tree.column("pixel", width=70, anchor="center")
+        self.tree.column("wavelength", width=140, anchor="center")
+        self.tree.column("delta_nm", width=70, anchor="center")
+        self.tree.column("delta_cm", width=70, anchor="center")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        # Row tags for color-coded fit quality
+        self.tree.tag_configure("inlier",   foreground=style_text)
+        self.tree.tag_configure("borderline", foreground="#ffdd57")
+        self.tree.tag_configure("outlier",  foreground="#ff6b6b")
+        self.tree.tag_configure("manual",   foreground="#aaffaa")
+        self.tree.tag_configure("auto",     foreground="#888888")
 
         # Add / remove row
         edit_frame = tk.Frame(self, bg=style_bg)
@@ -213,6 +223,20 @@ class CalibrationDialog(tk.Toplevel):
                   command=self._hard_copy_to_camera,
                   bg=style_accent, fg="#ffdd57", relief="flat",
                   padx=10, pady=4).pack(side="left")
+
+        # Fit-quality summary panel: shows fit RMS in both nm and cm⁻¹, the
+        # cm⁻¹ axis preview, and inlier counts. Populated by _calibrate(),
+        # and used by the user to spot a bad fit before applying.
+        self._quality_frame = tk.Frame(self, bg="#0d2840", padx=10, pady=6)
+        self._quality_frame.pack(fill="x", padx=10, pady=(4, 2))
+        self.quality_var = tk.StringVar(
+            value="Fit quality will appear here once you click Calibrate."
+        )
+        self.quality_label = tk.Label(self._quality_frame, textvariable=self.quality_var,
+                                       bg="#0d2840", fg="#888888",
+                                       font=("Helvetica", 9), justify="left",
+                                       wraplength=520, anchor="w")
+        self.quality_label.pack(anchor="w")
 
         # Status label
         self.status_var = tk.StringVar(
@@ -288,15 +312,15 @@ class CalibrationDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Input Error", "Enter valid numbers for pixel and wavelength.")
             return
-        
+
         # Smart Add: If pixel already in list (within 1px), update its wavelength instead of adding new
         for i, pix in enumerate(self.peak_pixels):
             if abs(pix - p) < 1.0:
                 self.known_wl[i] = w
-                # Update treeview
                 for item in self.tree.get_children():
                     if abs(float(self.tree.item(item, 'values')[0]) - p) < 1.0:
-                        self.tree.item(item, values=(f"{p:.1f}", f"{w:.3f}"))
+                        self.tree.item(item, values=(f"{p:.1f}", f"{w:.3f}", "—", "—"),
+                                       tags=("manual",))
                         break
                 self.status_var.set(f"Updated peak at pixel {p:.1f}")
                 return
@@ -304,7 +328,8 @@ class CalibrationDialog(tk.Toplevel):
         self.peak_pixels.append(p)
         self.known_wl.append(w)
         self._auto_assigned = False
-        self.tree.insert("", "end", values=(f"{p:.1f}", f"{w:.3f}"))
+        self.tree.insert("", "end", values=(f"{p:.1f}", f"{w:.3f}", "—", "—"),
+                         tags=("manual",))
         self.pix_entry.delete(0, "end")
         self.wl_entry.delete(0, "end")
 
@@ -332,7 +357,8 @@ class CalibrationDialog(tk.Toplevel):
         self.known_wl[idx] = w
         self._auto_assigned = False
         p = self.peak_pixels[idx]
-        self.tree.item(sel[0], values=(f"{p:.1f}", f"{w:.3f}"))
+        self.tree.item(sel[0], values=(f"{p:.1f}", f"{w:.3f}", "—", "—"),
+                       tags=("manual",))
         self.status_var.set(f"Updated Pixel {p:.1f} → {w:.3f} nm")
         self.wl_entry.delete(0, "end") # Clear after update
 
@@ -372,8 +398,10 @@ class CalibrationDialog(tk.Toplevel):
         for p in peaks:
             self.peak_pixels.append(float(p))
             self.known_wl.append(0.0)
-            self.tree.insert("", "end", values=(f"{p:.1f}", "auto"))
-        
+            self.tree.insert("", "end",
+                             values=(f"{p:.1f}", "auto", "—", "—"),
+                             tags=("auto",))
+
         self.status_var.set(
             f"Detected {len(peaks)} lamp candidate peaks. Click Calibrate for automatic "
             f"{self.source_var.get()} source-line matching, or enter known wavelengths manually."
@@ -419,7 +447,7 @@ class CalibrationDialog(tk.Toplevel):
 
     def _auto_calibration_warning(self, info):
         residuals = np.asarray(info.get("residuals", []), dtype=float)
-        rms = float(info.get("rms", 0.0))
+        rms = float(info.get("rms_inliers", info.get("rms", 0.0)))
         max_error = float(info.get("max_error", 0.0))
         unique_lines = int(info.get("unique_lines", 0))
         line_span = float(info.get("line_span", 0.0))
@@ -427,7 +455,9 @@ class CalibrationDialog(tk.Toplevel):
         endpoint_max = info.get("endpoint_max")
         left_endpoint = info.get("left_endpoint")
         right_endpoint = info.get("right_endpoint")
-        n_lines = len(residuals)
+        n_inliers = int(info.get("n_inliers", 0))
+        n_outliers = int(info.get("n_outliers", 0))
+        n_lines = n_inliers + n_outliers if (n_inliers + n_outliers) else len(residuals)
         min_unique = 3 if self.model_var.get() == "Linear" else 5
 
         issues = []
@@ -439,6 +469,8 @@ class CalibrationDialog(tk.Toplevel):
             issues.append(f"RMS residual is {rms:.2f} nm")
         if max_error > 5.0:
             issues.append(f"largest residual is {max_error:.2f} nm")
+        if n_outliers > max(1, n_inliers // 3):
+            issues.append(f"{n_outliers} of {n_lines} detected peaks did not match any lamp line")
         if endpoint_min is not None and left_endpoint is not None:
             if abs(float(left_endpoint) - float(endpoint_min)) > 2.0:
                 issues.append(
@@ -452,7 +484,7 @@ class CalibrationDialog(tk.Toplevel):
 
         summary = (
             f"{self.source_var.get()} auto-fit diagnostics:\n"
-            f"  peaks: {n_lines}\n"
+            f"  peaks: {n_lines}  ({n_inliers} matched, {n_outliers} unmatched)\n"
             f"  unique source lines: {unique_lines}\n"
             f"  source-line span: {line_span:.1f} nm\n"
             f"  RMS residual: {rms:.3f} nm\n"
@@ -485,7 +517,7 @@ class CalibrationDialog(tk.Toplevel):
         n_pixels = len(self.spectrum_y) if self.spectrum_y is not None else None
 
         # Wavelengths entered by the user are treated as explicit manual pairs.
-        # Rows left as "auto" use the original source-line matching optimizer.
+        # Rows left as "auto" use the source-line matching optimizer.
         valid_pix = []
         valid_wl = []
         for p, w in zip(self.peak_pixels, self.known_wl):
@@ -495,6 +527,7 @@ class CalibrationDialog(tk.Toplevel):
 
         mode = "manual"
         rms = None
+        info = None
         try:
             manual_required = degree + 1
             use_auto_mode = len(valid_pix) == 0 or self._auto_assigned
@@ -510,15 +543,27 @@ class CalibrationDialog(tk.Toplevel):
                     n_pixels=n_pixels,
                     **self._auto_params(),
                 )
-                rms = info["rms"]
-                for idx, (item, nearest) in enumerate(zip(self.tree.get_children(), info["nearest"])):
-                    self.known_wl[idx] = float(nearest)
-                    self.tree.item(item, values=(f"{self.peak_pixels[idx]:.1f}", f"{nearest:.3f}"))
+                rms = info["rms_inliers"]
+                # Populate known_wl from the (dummy-aware) assignment. Outliers
+                # have nan in `nearest` — record them as 0.0 so the row still
+                # shows up but doesn't pollute future manual fits.
+                items = list(self.tree.get_children())
+                for idx, nearest in enumerate(info["nearest"]):
+                    if np.isfinite(nearest):
+                        self.known_wl[idx] = float(nearest)
+                    else:
+                        self.known_wl[idx] = 0.0
                 self._auto_assigned = True
+                # Populate residuals into the table BEFORE the confirm prompt,
+                # so the user sees per-peak quality while deciding to apply.
+                self._populate_residuals_in_table(coeffs, info=info)
+                self._show_quality_summary(coeffs, info=info)
+                default_choice = "no" if (info.get("rms_inliers", 0.0) > 0.5
+                                          or info.get("n_outliers", 0) > 0) else "yes"
                 if not messagebox.askyesno(
                     "Apply automatic calibration?",
                     self._auto_calibration_warning(info),
-                    default="no",
+                    default=default_choice,
                 ):
                     return
             else:
@@ -561,11 +606,133 @@ class CalibrationDialog(tk.Toplevel):
                 )
                 if not messagebox.askyesno("Non-monotonic calibration", msg, default="no"):
                     return
+        # Final residual populate + quality refresh, for manual mode (auto
+        # mode already did this before the confirm prompt).
+        if mode != "auto":
+            self._populate_residuals_in_table(coeffs, info=None)
+            self._show_quality_summary(coeffs, info=None)
         self.on_solution(coeffs)
         rms_text = f", RMS {rms:.3f} nm" if rms is not None else ""
         self.status_var.set(
             f"✓ Calibration OK ({mode}{rms_text}). Coefficients: {[round(c,4) for c in coeffs]}"
         )
+
+    # ── Residual / quality helpers ────────────────────────────────────────
+
+    def _populate_residuals_in_table(self, coeffs, info=None):
+        """
+        Refresh the table's Δ(nm) and Δ(cm⁻¹) columns under ``coeffs``.
+
+        Each row is also tagged so that the foreground color makes inliers,
+        borderline peaks and outliers immediately visible — the user can
+        scan the table once and spot a wrong source-line assignment that
+        would otherwise hide inside a moderate overall RMS.
+        """
+        from numpy.polynomial import legendre
+        n_pixels = len(self.spectrum_y) if self.spectrum_y is not None else None
+        laser = self.laser_nm
+        coeffs_arr = np.asarray(coeffs, dtype=float)
+
+        pix_arr = np.asarray(self.peak_pixels, dtype=float)
+        if pix_arr.size == 0:
+            return
+        t = dsp.normalize_pixels(pix_arr, n_pixels=n_pixels)
+        projected_wl = legendre.legval(t, coeffs_arr)
+        projected_cm = dsp.wavelengths_to_raman(projected_wl, laser)
+
+        items = list(self.tree.get_children())
+        inlier_mask = (info.get("inlier_mask") if info is not None else None)
+        for i, (item, p, known) in enumerate(zip(items, self.peak_pixels, self.known_wl)):
+            row_proj_wl = float(projected_wl[i])
+            row_proj_cm = float(projected_cm[i])
+            if known and known > 0:
+                target_cm = float(dsp.wavelengths_to_raman(np.array([float(known)]), laser)[0])
+                delta_nm = row_proj_wl - float(known)
+                delta_cm = row_proj_cm - target_cm
+                if inlier_mask is not None and i < len(inlier_mask) and not bool(inlier_mask[i]):
+                    tag = "outlier"
+                elif abs(delta_nm) < 0.05:
+                    tag = "inlier"
+                elif abs(delta_nm) < 0.3:
+                    tag = "borderline"
+                else:
+                    tag = "outlier"
+                self.tree.item(item, values=(
+                    f"{p:.1f}",
+                    f"{float(known):.3f}",
+                    f"{delta_nm:+.3f}",
+                    f"{delta_cm:+.1f}",
+                ), tags=(tag,))
+            else:
+                # Unassigned peak (outlier from auto-fit, or never given an nm).
+                self.tree.item(item, values=(
+                    f"{p:.1f}", "unassigned", "—", "—",
+                ), tags=("outlier",))
+
+    def _show_quality_summary(self, coeffs, info=None):
+        """Update the dark-blue quality banner above the buttons."""
+        from numpy.polynomial import legendre
+        laser = self.laser_nm
+        coeffs_arr = np.asarray(coeffs, dtype=float)
+
+        # cm⁻¹ axis preview: where the detector endpoints land after this fit.
+        wl_left = float(legendre.legval(-1.0, coeffs_arr))
+        wl_right = float(legendre.legval(1.0, coeffs_arr))
+        cm_left = float(dsp.wavelengths_to_raman(np.array([wl_left]), laser)[0])
+        cm_right = float(dsp.wavelengths_to_raman(np.array([wl_right]), laser)[0])
+        cm_lo, cm_hi = (cm_left, cm_right) if cm_left < cm_right else (cm_right, cm_left)
+        wl_lo, wl_hi = (wl_left, wl_right) if wl_left < wl_right else (wl_right, wl_left)
+        avg_wl = 0.5 * (wl_lo + wl_hi)
+
+        if info is not None:
+            rms_nm = float(info.get("rms_inliers", info.get("rms", 0.0)))
+            max_err_nm = float(info.get("max_error", 0.0))
+            n_in = int(info.get("n_inliers", 0))
+            n_out = int(info.get("n_outliers", 0))
+        else:
+            pairs = [(p, w) for p, w in zip(self.peak_pixels, self.known_wl) if w and w > 0]
+            if pairs:
+                pix = np.array([pp[0] for pp in pairs])
+                wl = np.array([pp[1] for pp in pairs])
+                n_pixels = len(self.spectrum_y) if self.spectrum_y is not None else None
+                t = dsp.normalize_pixels(pix, n_pixels=n_pixels)
+                pred = legendre.legval(t, coeffs_arr)
+                residuals = pred - wl
+                rms_nm = float(np.sqrt(np.mean(residuals ** 2)))
+                max_err_nm = float(np.max(np.abs(residuals)))
+                n_in = len(pairs)
+                n_out = 0
+            else:
+                rms_nm = max_err_nm = 0.0
+                n_in = n_out = 0
+
+        # Convert nm RMS to approximate cm⁻¹ at the mean wavelength using
+        # the local derivative of the Raman-shift formula:
+        # |d(cm⁻¹)/d(wl)| = 1e7 / wl² .
+        rms_cm = rms_nm * 1.0e7 / (avg_wl * avg_wl) if avg_wl > 0 else 0.0
+        max_err_cm = max_err_nm * 1.0e7 / (avg_wl * avg_wl) if avg_wl > 0 else 0.0
+
+        if rms_nm < 0.05:
+            verdict, color = "✓✓ excellent fit", "#aaffaa"
+        elif rms_nm < 0.2:
+            verdict, color = "✓ good fit", "#aaffaa"
+        elif rms_nm < 0.5:
+            verdict, color = "⚠ acceptable — check residuals", "#ffdd57"
+        else:
+            verdict, color = "✗ POOR fit — see red rows above", "#ff6b6b"
+
+        out_text = f", {n_out} outlier{'s' if n_out != 1 else ''}" if n_out else ""
+        msg = (
+            f"{verdict}\n"
+            f"RMS = {rms_nm:.3f} nm  (~{rms_cm:.1f} cm⁻¹)    "
+            f"max Δ = {max_err_nm:.3f} nm  (~{max_err_cm:.1f} cm⁻¹)    "
+            f"{n_in} inlier{'s' if n_in != 1 else ''}{out_text}\n"
+            f"Axis preview @ {laser:.2f} nm laser:  "
+            f"{wl_lo:.2f}–{wl_hi:.2f} nm   →   "
+            f"{cm_lo:.0f} – {cm_hi:.0f} cm⁻¹"
+        )
+        self.quality_var.set(msg)
+        self.quality_label.config(fg=color)
 
 
 class SampleCalibrationDialog(tk.Toplevel):
