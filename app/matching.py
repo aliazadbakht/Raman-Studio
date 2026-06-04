@@ -34,7 +34,15 @@ def resample_to_grid(x, y, grid):
 
 
 def prepare_for_matching(y_on_grid, do_baseline=True):
-    """Baseline-remove (if requested), clip negatives, and L2-normalize."""
+    """Baseline-remove (if requested), clip negatives, and L2-normalize.
+
+    NOTE: prefer :func:`prepare_query`, which baseline-corrects at the
+    spectrum's native resolution *before* resampling. Running the baseline on
+    an already-resampled vector is unsafe when the spectrum doesn't span the
+    whole grid: ``resample_to_grid`` zero-pads outside the data range, and the
+    polynomial baseline cannot follow the resulting step at the data boundary,
+    leaving a large artifact peak that dominates the normalized vector.
+    """
     y = np.asarray(y_on_grid, dtype=float)
     if do_baseline:
         y = y - dsp.baseline_schulze(y, max_iter=30)
@@ -43,6 +51,31 @@ def prepare_for_matching(y_on_grid, do_baseline=True):
     if n > 0:
         y = y / n
     return y
+
+
+def prepare_query(x, y, grid, do_baseline=True):
+    """Baseline-correct (native resolution), resample to ``grid``, clip, L2-normalize.
+
+    This is the matching front-end for both queries and library references.
+    The baseline is removed from the *native* spectrum before resampling so
+    the zero-padding outside the data range can't create a step the polynomial
+    baseline fails to follow — otherwise a spurious peak survives at the data
+    boundary and, after L2-normalization, dominates the cosine score (making
+    every partial-range spectrum match the same handful of references).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    if do_baseline:
+        y = y - dsp.baseline_schulze(y, max_iter=30)
+    y_grid = np.interp(grid, x, y, left=0.0, right=0.0)
+    y_grid = np.clip(y_grid, 0.0, None)
+    n = float(np.linalg.norm(y_grid))
+    if n > 0:
+        y_grid = y_grid / n
+    return y_grid
 
 
 def cosine_similarity(a, b):
@@ -81,3 +114,67 @@ def top_matches(scores, k=10):
         partial = np.argpartition(scores, -k)[-k:]
         order = partial[np.argsort(scores[partial])[::-1]]
     return order
+
+
+# ── Refinement re-rank (shift-tolerant, fingerprint-weighted) ──────────────────
+# Whole-spectrum cosine is dominated by the broad C–H stretch (~2800–3000 cm⁻¹),
+# which most organics share, so near-twin compounds (e.g. acetone vs. butanone)
+# end up tied. A small calibration error also shifts the query's peaks off the
+# references and penalizes the (sharp-banded) correct hit more than a broad wrong
+# one. The refinement re-ranks the top cosine candidates with a cosine that
+#   (a) takes the best score over a small ± shift, absorbing calibration error, and
+#   (b) emphasizes the fingerprint region, where compounds actually differ.
+# It is a re-rank only: stage-1 recall (which candidates surface) is unchanged.
+
+FINGERPRINT_MIN = 250.0
+FINGERPRINT_MAX = 1800.0
+FINGERPRINT_OUTSIDE_WEIGHT = 0.35
+REFINE_SHIFT_CM = 24.0
+
+
+def fingerprint_weights(grid):
+    """1.0 inside the fingerprint region, down-weighted outside (e.g. C–H stretch)."""
+    grid = np.asarray(grid, dtype=float)
+    return np.where((grid >= FINGERPRINT_MIN) & (grid <= FINGERPRINT_MAX),
+                    1.0, FINGERPRINT_OUTSIDE_WEIGHT)
+
+
+def refine_scores(query_x, query_y, grid, library_matrix, candidates, do_baseline=True):
+    """Re-score ``candidates`` (row indices into ``library_matrix``) with a
+    shift-tolerant, fingerprint-weighted cosine. Returns scores in [0, 100], one
+    per candidate, in the same order as ``candidates``.
+
+    The baseline is removed once at native resolution; each trial shift only
+    re-interpolates onto the grid, so the loop stays cheap.
+    """
+    grid = np.asarray(grid, dtype=float)
+    x = np.asarray(query_x, dtype=float)
+    y = np.asarray(query_y, dtype=float)
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    if do_baseline:
+        y = y - dsp.baseline_schulze(y, max_iter=30)
+
+    w = fingerprint_weights(grid)
+    step = float(grid[1] - grid[0]) if len(grid) > 1 else 1.0
+    n_shift = int(round(REFINE_SHIFT_CM / step)) if step else 0
+
+    q_rows = []
+    for s in range(-n_shift, n_shift + 1):
+        yg = np.interp(grid, x + s * step, y, left=0.0, right=0.0)
+        yg = np.clip(yg, 0.0, None) * w
+        nrm = np.linalg.norm(yg)
+        if nrm > 0:
+            yg = yg / nrm
+        q_rows.append(yg)
+    Q = np.vstack(q_rows)
+
+    refs = np.asarray(library_matrix)[np.asarray(candidates, dtype=int)].astype(float) * w
+    rn = np.linalg.norm(refs, axis=1, keepdims=True)
+    rn[rn == 0] = 1.0
+    refs = refs / rn
+
+    sims = Q @ refs.T                       # (n_shift, n_candidates)
+    best = sims.max(axis=0)
+    return 100.0 * np.clip(best, 0.0, 1.0)

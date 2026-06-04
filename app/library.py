@@ -197,10 +197,31 @@ class Library:
         Score a raw query spectrum (any cm⁻¹ range) against the library.
         Returns (scores, query_prepared_on_grid).
         """
-        q_grid = matching.resample_to_grid(query_x, query_y, self.grid)
-        q_norm = matching.prepare_for_matching(q_grid, do_baseline=do_baseline)
+        q_norm = matching.prepare_query(query_x, query_y, self.grid, do_baseline=do_baseline)
         scores = matching.score_against_matrix(q_norm, self.matrix)
         return scores, q_norm
+
+    def match(self, query_x, query_y, do_baseline=True, k=15, refine=True, refine_pool=40):
+        """Score a raw query spectrum and return ``(scores, top_indices)``.
+
+        Stage 1 is a fast whole-spectrum cosine over the entire library (this is
+        what decides which references surface). With ``refine``, the top
+        ``refine_pool`` candidates are then re-ranked with a shift-tolerant,
+        fingerprint-weighted cosine (see :func:`matching.refine_scores`) — which
+        separates near-twin compounds and tolerates small calibration offsets.
+        The returned ``scores`` array carries the refined values for the re-ranked
+        candidates so the displayed HQI matches the ordering.
+        """
+        q_norm = matching.prepare_query(query_x, query_y, self.grid, do_baseline=do_baseline)
+        base = matching.score_against_matrix(q_norm, self.matrix)
+        if not refine or self.is_empty():
+            return base, matching.top_matches(base, k=k)
+        pool = matching.top_matches(base, k=min(refine_pool, len(base)))
+        refined = matching.refine_scores(query_x, query_y, self.grid, self.matrix,
+                                         pool, do_baseline=do_baseline)
+        scores = base.copy()
+        scores[pool] = refined
+        return scores, matching.top_matches(scores, k=k)
 
     def reference_on_grid(self, idx) -> np.ndarray:
         return self.matrix[idx]
@@ -252,8 +273,7 @@ class Library:
                 x, y, meta = _parse_any(path)
             except Exception:
                 continue
-            y_grid = matching.resample_to_grid(x, y, grid)
-            y_prep = matching.prepare_for_matching(y_grid, do_baseline=True)
+            y_prep = matching.prepare_query(x, y, grid, do_baseline=True)
             if not np.any(y_prep > 0):
                 continue
             rows.append(y_prep.astype(np.float32))

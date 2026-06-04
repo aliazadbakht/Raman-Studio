@@ -236,14 +236,11 @@ class MatchPanel(tk.Frame):
                 "and click 'Rebuild library index'.")
             return
         try:
-            scores, _ = self.library.score(x, y, do_baseline=True)
+            scores, top = self.library.match(x, y, do_baseline=True, k=15)
         except Exception as e:
             messagebox.showerror("Match error", str(e))
             return
 
-        # Top 15
-        from . import matching as mm
-        top = mm.top_matches(scores, k=15)
         self._results = (scores, top)
         self._populate_listbox(scores, top)
         self.app._replot()

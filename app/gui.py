@@ -13,6 +13,8 @@ from . import dsp, fileio
 from .camera import Camera, CameraError, list_cameras
 from .calibration_dialog import CalibrationDialog, SampleCalibrationDialog
 from .match_panel import MatchPanel
+from PIL import Image, ImageTk, ImageDraw
+
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BG        = "#1a1a2e"
@@ -41,6 +43,7 @@ class RamanApp:
         self.live_running = False
         self._live_thread: threading.Thread | None = None
 
+        self.cam_view_window = None
         self.raw_signal: np.ndarray | None = None
         self.blank_signal: np.ndarray | None = None
         self.calibration = fileio.load_calibration()
@@ -102,6 +105,7 @@ class RamanApp:
         self.btn_connect = btn("🔌 Connect", self.on_connect, color="#aaffaa")
         self.btn_capture = btn("📷 Capture", self.on_capture)
         self.btn_live    = btn("▶ Live",    self.on_live_toggle, color="#ffdd57")
+        self.btn_cam_view = btn("📹 Live Cam", self.on_cam_view_toggle, color="#a3ffd9")
         sep()
         btn("⬛ Set Blank",   self.on_set_blank,   color="#ffaa44")
         btn("✖ Clr Blank",   self.on_clear_blank,  color="#ff6b6b", width=10)
@@ -507,6 +511,16 @@ class RamanApp:
             self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
             self._live_thread.start()
 
+    def on_cam_view_toggle(self):
+        if self.cam_view_window is not None:
+            self.cam_view_window.lift()
+            self.cam_view_window.focus_force()
+        else:
+            if self.camera is None:
+                messagebox.showinfo("No Camera", "Connect a camera first.")
+                return
+            self.cam_view_window = CameraViewWindow(self.root, self)
+
     def _live_loop(self):
         while self.live_running:
             try:
@@ -907,6 +921,10 @@ class RamanApp:
 
         self.canvas.draw_idle()
 
+        # Update Live Cam view if open
+        if getattr(self, "cam_view_window", None) is not None:
+            self.cam_view_window.update_image()
+
     def _apply_xrange(self):
         """Apply manual X-limits from the sidebar entries, if both are numeric."""
         try:
@@ -1092,6 +1110,127 @@ class RamanApp:
             )
         except Exception:
             self._cal_health = None
+
+
+# ── Live Camera View helper ───────────────────────────────────────────────────
+
+class CameraViewWindow(tk.Toplevel):
+    def __init__(self, parent, app_instance):
+        super().__init__(parent)
+        self.title("Live Camera View")
+        self.configure(bg=BG)
+        self.app = app_instance
+        self.geometry("680x540")
+        self.resizable(True, True)
+
+        # Label to display the image
+        self.img_label = tk.Label(self, bg=BG)
+        self.img_label.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Control Frame for options
+        ctrl_frame = tk.Frame(self, bg=BG)
+        ctrl_frame.pack(fill="x", side="bottom", pady=(0, 5))
+
+        # Checkbox to toggle full sensor view
+        self.full_sensor_var = tk.BooleanVar(value=False)
+        self.chk_full = ttk.Checkbutton(ctrl_frame, text="Show Full Sensor (Reset Hardware ROI)",
+                                         variable=self.full_sensor_var,
+                                         command=self.on_full_sensor_toggle)
+        self.chk_full.pack(pady=2)
+
+        # Status/info label
+        self.info_var = tk.StringVar(value="Start 'Live' mode to see the camera feed.")
+        tk.Label(ctrl_frame, textvariable=self.info_var, bg=BG, fg=TEXT,
+                 font=("Helvetica", 10)).pack(fill="x", pady=2)
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_image()
+
+    def on_full_sensor_toggle(self):
+        if self.app.camera is None:
+            return
+        try:
+            if self.full_sensor_var.get():
+                # Show full sensor: reset offsets to 0 and size to max
+                self.app.camera.set_hardware_roi()
+            else:
+                # Restore original cropped ROI
+                self.app.camera.restore_hardware_roi()
+            # Trigger a replot/refresh to fetch the new frame dimensions
+            self.app._replot()
+        except Exception as e:
+            messagebox.showerror("ROI Error", f"Failed to change hardware ROI: {e}")
+            self.full_sensor_var.set(not self.full_sensor_var.get())
+
+    def update_image(self):
+        if not self.winfo_exists():
+            return
+
+        # Get last frame from camera
+        gray = None
+        if self.app.camera and getattr(self.app.camera, "last_frame", None) is not None:
+            gray = self.app.camera.last_frame
+
+        if gray is not None:
+            h, w = gray.shape
+
+            # Normalize to 0-255 for display
+            g_min, g_max = float(gray.min()), float(gray.max())
+            if g_max > g_min:
+                img_data = ((gray - g_min) / (g_max - g_min) * 255.0).astype(np.uint8)
+            else:
+                img_data = np.zeros_like(gray, dtype=np.uint8)
+
+            img = Image.fromarray(img_data)
+
+            # Draw ROI bounds
+            try:
+                roi_rows = int(self.app.roi_var.get())
+            except Exception:
+                roi_rows = 0
+
+            if roi_rows > 0 and roi_rows < h:
+                cy = h // 2
+                r = roi_rows // 2
+                # Draw red box indicating the ROI region
+                img = img.convert("RGB")
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([0, max(0, cy - r), w - 1, min(h - 1, cy + r)], outline="#ff6b6b", width=2)
+
+            # Resize image to fit window width dynamically
+            window_width = self.winfo_width()
+            if window_width < 100:
+                window_width = 640
+            
+            target_width = max(320, window_width - 20)
+            scale = target_width / w
+            target_height = int(h * scale)
+            
+            img_resized = img.resize((target_width, target_height), Image.Resampling.BILINEAR)
+
+            self.photo = ImageTk.PhotoImage(image=img_resized)
+            self.img_label.configure(image=self.photo)
+            
+            # Show saturating pixels percent or count
+            sat_count = int(np.sum(gray >= 254 if g_max <= 255 else gray >= 4094))
+            sat_msg = f"  |  Saturated: {sat_count} px" if sat_count > 0 else ""
+            self.info_var.set(
+                f"Resolution: {w}x{h} px  |  ROI Rows: {roi_rows}  |  Range: {int(g_min)}-{int(g_max)}{sat_msg}"
+            )
+        else:
+            if self.app.live_running:
+                self.info_var.set("Waiting for first frame...")
+            else:
+                self.info_var.set("Camera idle. Click 'Live' to start feed.")
+
+    def on_close(self):
+        if self.full_sensor_var.get() and self.app.camera is not None:
+            try:
+                self.app.camera.restore_hardware_roi()
+            except Exception:
+                pass
+        self.app.cam_view_window = None
+        self.destroy()
 
 
 # ── Camera picker helper ───────────────────────────────────────────────────────

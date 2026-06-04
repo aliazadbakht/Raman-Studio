@@ -84,6 +84,8 @@ class FlirCamera:
         self._gain = 0.0
         self._roi_rows = None
         self._lock = threading.Lock()
+        self.last_frame = None
+
 
     def _load_user_set2(self):
         nodemap = self._cam.GetNodeMap()
@@ -279,6 +281,7 @@ class FlirCamera:
 
     def acquire_spectrum(self):
         gray = self.grab_frame()
+        self.last_frame = gray
         h, w = gray.shape
         
         if self._roi_rows and self._roi_rows < h:
@@ -293,6 +296,49 @@ class FlirCamera:
         roi_profile = gray.max(axis=1)
 
         return signal, saturation, roi_profile
+
+    def set_hardware_roi(self, width=None, height=None, offset_x=0, offset_y=0):
+        def adjust():
+            nodemap = self._cam.GetNodeMap()
+            
+            # Offsets must be set to 0 first before changing Width/Height to avoid range violations
+            ox_node = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
+            if PySpin.IsAvailable(ox_node) and PySpin.IsWritable(ox_node):
+                ox_node.SetValue(0)
+            oy_node = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
+            if PySpin.IsAvailable(oy_node) and PySpin.IsWritable(oy_node):
+                oy_node.SetValue(0)
+
+            # Width
+            w_node = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+            if PySpin.IsAvailable(w_node) and PySpin.IsWritable(w_node):
+                w_max = w_node.GetMax()
+                w_val = min(w_max, width) if width is not None else w_max
+                inc = w_node.GetInc()
+                if inc > 1:
+                    w_val = (w_val // inc) * inc
+                w_node.SetValue(w_val)
+                
+            # Height
+            h_node = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+            if PySpin.IsAvailable(h_node) and PySpin.IsWritable(h_node):
+                h_max = h_node.GetMax()
+                h_val = min(h_max, height) if height is not None else h_max
+                inc = h_node.GetInc()
+                if inc > 1:
+                    h_val = (h_val // inc) * inc
+                h_node.SetValue(h_val)
+                
+            # Now set the desired OffsetX and OffsetY
+            if offset_x > 0 and PySpin.IsAvailable(ox_node) and PySpin.IsWritable(ox_node):
+                ox_node.SetValue(min(ox_node.GetMax(), offset_x))
+            if offset_y > 0 and PySpin.IsAvailable(oy_node) and PySpin.IsWritable(oy_node):
+                oy_node.SetValue(min(oy_node.GetMax(), offset_y))
+                
+        self._with_acquisition_paused(adjust)
+
+    def restore_hardware_roi(self):
+        self._with_acquisition_paused(self._load_user_set2)
 
     def release(self):
         try:
