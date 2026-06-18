@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """
 Match panel: side panel that scores the current spectrum against a
 reference library and shows the top hits with HQI scores. Selecting a hit

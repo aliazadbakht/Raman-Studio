@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """
 Spectral matching: resample a query spectrum onto a common cm⁻¹ grid,
 baseline-correct and L2-normalize, then score against a library matrix

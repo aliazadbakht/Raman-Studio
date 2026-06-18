@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """File I/O: CSV load/save and a simple .rspc binary format."""
 import csv
 import json

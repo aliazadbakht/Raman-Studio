@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """Digital signal processing utilities for Raman spectra."""
 import numpy as np
 from numpy.polynomial import legendre

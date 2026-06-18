@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """Camera acquisition – exclusively supports FLIR/PointGrey (Spinnaker SDK)."""
 import struct
 import threading

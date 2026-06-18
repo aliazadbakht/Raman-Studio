@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """Read and write OpenRAMAN Spectrum Analyzer .spc files."""
 from __future__ import annotations
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+# Copyright (c) 2026 Wfront Principle B.V.
 """Raman Spectrum Analyzer for macOS"""
 import os
-import sys
 
 # Auto-configure Spinnaker SDK environment variables for macOS
 if "DYLD_LIBRARY_PATH" not in os.environ:
