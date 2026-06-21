@@ -3,7 +3,7 @@
 """Main GUI for Raman Spectrum Analyzer – macOS."""
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading, time, os
+import threading, time, os, atexit
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
@@ -39,6 +39,19 @@ class RamanApp:
         root.configure(bg=BG)
         root.geometry("1280x820")
         root.minsize(900, 600)
+        # Release the camera (Spinnaker System) while the interpreter is still
+        # alive. Without this, PySpin/libusb teardown runs at exit() and aborts
+        # (SIGABRT in libusb_exit) every time the app is closed.
+        root.protocol("WM_DELETE_WINDOW", self.on_app_close)
+        # macOS routes Cmd+Q / Dock-quit / Apple-menu-Quit through this command
+        # rather than WM_DELETE_WINDOW, so intercept it too.
+        try:
+            root.createcommand("::tk::mac::Quit", self.on_app_close)
+        except tk.TclError:
+            pass
+        # Last-resort net for any exit path we didn't intercept: release before
+        # the C++ static destructors run at process exit.
+        atexit.register(self._release_camera)
 
         # ── State ─────────────────────────────────────────────────────────────
         self.camera: Camera | None = None
@@ -85,19 +98,26 @@ class RamanApp:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_toolbar(self):
-        bar = tk.Frame(self.root, bg=ACCENT, pady=4)
+        # Flow toolbar: buttons are laid out with place() and wrap onto extra
+        # rows when the window is too narrow, so nothing (e.g. Match) ever gets
+        # clipped off the right edge in a non-fullscreen window.
+        bar = tk.Frame(self.root, bg=ACCENT)
         bar.pack(fill="x")
+        self._toolbar = bar
+        self._toolbar_items = []      # (widget, left_pad) in display order
+        self._toolbar_last_w = -1
 
         def btn(text, cmd, color=CYAN, width=9):
             b = tk.Button(bar, text=text, command=cmd, bg=ACCENT, fg=color,
                           font=("Helvetica", 9, "bold"), relief="flat",
                           activebackground=BG2, activeforeground=CYAN,
                           padx=6, pady=3, width=width)
-            b.pack(side="left", padx=2)
+            self._toolbar_items.append((b, 2))
             return b
 
         def sep():
-            tk.Frame(bar, bg=BG2, width=2).pack(side="left", fill="y", padx=4, pady=2)
+            s = tk.Frame(bar, bg=BG2, width=2, height=22)
+            self._toolbar_items.append((s, 6))
 
         btn("📂 Open",    self.on_open)
         btn("💾 Save",    self.on_save)
@@ -119,6 +139,41 @@ class RamanApp:
         self.btn_match = btn("🔬 Match", self.on_match_toggle, color="#a3ffd9")
         sep()
         btn("❓ About",      self.on_about, color=MUTED, width=7)
+
+        bar.bind("<Configure>", self._reflow_toolbar)
+        # Lay out once after widget sizes are known.
+        self.root.after_idle(self._reflow_toolbar)
+
+    def _reflow_toolbar(self, event=None):
+        """Wrap toolbar items onto as many rows as the current width needs."""
+        bar = self._toolbar
+        width = bar.winfo_width()
+        # Re-running on a height-only change (our own configure below) would loop.
+        if width <= 1 or width == self._toolbar_last_w:
+            return
+        self._toolbar_last_w = width
+
+        PAD_TOP, ROW_GAP = 4, 4
+        # Pass 1: greedily break the items into rows that fit the width.
+        rows, cur, x = [], [], 0
+        for w, lpad in self._toolbar_items:
+            rw = w.winfo_reqwidth()
+            if cur and x + lpad + rw > width:
+                rows.append(cur)
+                cur, x = [], 0
+            cur.append((w, x + lpad, w.winfo_reqheight()))
+            x += lpad + rw
+        if cur:
+            rows.append(cur)
+
+        # Pass 2: place each row, vertically centering items within the row.
+        y = PAD_TOP
+        for row in rows:
+            row_h = max(rh for _, _, rh in row)
+            for w, ix, rh in row:
+                w.place(x=ix, y=y + (row_h - rh) // 2, anchor="nw")
+            y += row_h + ROW_GAP
+        bar.configure(height=y - ROW_GAP + PAD_TOP)
 
     def _apply_ttk_style(self):
         s = ttk.Style()
@@ -190,9 +245,11 @@ class RamanApp:
         self.gain_label.pack(anchor="e", padx=12)
 
         self.roi_var = tk.IntVar(value=10)
-        row("ROI rows", lambda f: ttk.Spinbox(f, from_=1, to=1000,
+        roi_spin = row("ROI rows", lambda f: ttk.Spinbox(f, from_=1, to=1000,
                                                textvariable=self.roi_var, width=7,
                                                command=self._on_roi))
+        roi_spin.bind("<Return>", self._on_roi)
+        roi_spin.bind("<FocusOut>", self._on_roi)
 
         self.avg_var = tk.IntVar(value=1)
         row("Averages", lambda f: ttk.Spinbox(f, from_=1, to=100,
@@ -238,6 +295,10 @@ class RamanApp:
                                               values=["Pixels","Wavelengths","Raman Shifts"],
                                               state="readonly", width=14))
         self.axis_var.trace_add("write", lambda *_: self._replot())
+
+        self.flip_x_var = tk.BooleanVar(value=False)
+        row("Flip X-axis", lambda f: ttk.Checkbutton(f, variable=self.flip_x_var,
+                                                      command=self._replot))
 
         self.laser_var = tk.DoubleVar(value=532.0)
         self.laser_entry = row("Laser (nm)", lambda f: tk.Entry(f, textvariable=self.laser_var, width=8,
@@ -510,6 +571,12 @@ class RamanApp:
                 return
             self.live_running = True
             self.btn_live.config(text="⏹ Stop", fg=ORANGE)
+            # Drop any frame buffered with the previous settings so the first
+            # live frame reflects the current exposure/gain, not a stale one.
+            try:
+                self.camera.flush_stream()
+            except Exception:
+                pass
             self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
             self._live_thread.start()
 
@@ -713,6 +780,37 @@ class RamanApp:
             "Based on The Pulsar Engineering SpectrumAnalyzer (CERN OHL-W v2)\n"
             "macOS port: Python/Tkinter/Matplotlib")
 
+    def on_app_close(self):
+        """Shut down cleanly: stop streaming and release the camera before the
+        window (and interpreter) tear down, so the Spinnaker/libusb cleanup runs
+        while Python is still alive instead of aborting at process exit."""
+        # Stop the Live loop and wait for the worker so no frame grab is in
+        # flight when we release the camera.
+        self.live_running = False
+        thread = self._live_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        # Close the Live Camera view (restores hardware ROI) if it's open.
+        if self.cam_view_window is not None:
+            try:
+                self.cam_view_window.on_close()
+            except Exception:
+                pass
+        self._release_camera()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _release_camera(self):
+        """Release the Spinnaker camera once; safe to call repeatedly."""
+        cam, self.camera = self.camera, None
+        if cam is not None:
+            try:
+                cam.release()
+            except Exception:
+                pass
+
     # ═══════════════════════════════════════════════════════════════════════════
     # Camera callbacks
     # ═══════════════════════════════════════════════════════════════════════════
@@ -788,9 +886,13 @@ class RamanApp:
         if self.camera:
             self.camera.set_gain(v)
 
-    def _on_roi(self):
+    def _on_roi(self, *_):
         if self.camera:
-            self.camera.set_roi(self.roi_var.get())
+            try:
+                rows = int(self.roi_var.get())
+            except (tk.TclError, ValueError):
+                return
+            self.camera.set_roi(rows)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Axis computation
@@ -913,11 +1015,6 @@ class RamanApp:
                                  bbox=dict(facecolor=PLOT_BG, edgecolor="#ff6b6b",
                                            boxstyle="round,pad=0.25"))
 
-        # IR-style convention: when plotting in wavenumbers (Raman shift or
-        # absolute), high values on the left, low on the right.
-        if self.x_label == "Raman Shift (cm⁻¹)":
-            self.ax.invert_xaxis()
-
         # Manual X-range override
         self._apply_xrange()
 
@@ -929,17 +1026,23 @@ class RamanApp:
 
     def _apply_xrange(self):
         """Apply manual X-limits from the sidebar entries, if both are numeric."""
+        should_invert = (self.x_label == "Raman Shift (cm⁻¹)") ^ self.flip_x_var.get()
         try:
             lo = float(self.xmin_var.get())
             hi = float(self.xmax_var.get())
+            if lo == hi:
+                raise ValueError
         except (ValueError, AttributeError):
             if self.x_label == "Raman Shift (cm⁻¹)":
-                self.ax.set_xlim(3500, 500)
+                if should_invert:
+                    self.ax.set_xlim(3500, 500)
+                else:
+                    self.ax.set_xlim(500, 3500)
+            else:
+                if should_invert:
+                    self.ax.invert_xaxis()
             return
-        if lo == hi:
-            return
-        # If axis was inverted (cm⁻¹), set_xlim with hi first preserves that.
-        if self.x_label == "Raman Shift (cm⁻¹)":
+        if should_invert:
             self.ax.set_xlim(max(lo, hi), min(lo, hi))
         else:
             self.ax.set_xlim(min(lo, hi), max(lo, hi))

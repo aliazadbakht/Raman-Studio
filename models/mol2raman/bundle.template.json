@@ -1,0 +1,50 @@
+{
+  "_comment": "Copy to bundle.json and fill in once you have the Mol2Raman checkpoints. Paths are relative to this folder. The defaults below match the two-band pipeline in the paper (fingerprint 500-2100 + CH 1900-3500, 800 points each, stitched). Adjust to whatever the authors actually ship — confirm n_data_points, the cm axis, the model class, and the global-feature order/sizes against their config.json on the first real run.",
+  "mc_samples": 10,
+  "bands": [
+    {
+      "name": "low",
+      "spectra_checkpoint": "spectra_fingerprint_500_2100.pth",
+      "spectra_class": "GINEGLOBAL",
+      "dim_h": 256,
+      "additional_feature_size": 4097,
+      "n_data_points": 800,
+      "cm_min": 500,
+      "cm_max": 2100,
+      "numpeak_checkpoint": "numpeak_down.pth",
+      "numpeak_class": "ModelPredNumPeak",
+      "numpeak_dim_h": 256
+    },
+    {
+      "name": "high",
+      "spectra_checkpoint": "spectra_ch_1900_3500.pth",
+      "spectra_class": "GINEGLOBAL",
+      "dim_h": 256,
+      "additional_feature_size": 4097,
+      "n_data_points": 800,
+      "cm_min": 1900,
+      "cm_max": 3500,
+      "numpeak_checkpoint": "numpeak_up.pth",
+      "numpeak_class": "ModelPredNumPeak",
+      "numpeak_dim_h": 256
+    }
+  ],
+  "global_features": {
+    "order": ["num_peak", "morgan", "rdkit"],
+    "morgan_radius": 3,
+    "morgan_bits": 2048,
+    "rdkit_bits": 2048
+  },
+  "stitch": {
+    "axis_start": 501,
+    "axis_stop": 3500,
+    "axis_step": 2,
+    "band_len": 800,
+    "keep_head": 700,
+    "overlap": 100
+  },
+  "lorentzian": {
+    "gamma": 2.5,
+    "kernel_size": 600
+  }
+}

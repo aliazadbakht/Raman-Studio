@@ -80,12 +80,19 @@ class FlirCamera:
                     pixel_format.SetIntValue(entry.GetValue())
                     break
         self._set_bool_node("ReverseX", True)
+        self._set_newest_only_buffering()
 
         self._cam.BeginAcquisition()
         self._exposure = 0.1
         self._gain = 0.0
         self._roi_rows = None
-        self._lock = threading.Lock()
+        # Re-entrant so a locked method can call another locked method.
+        self._lock = threading.RLock()
+        # Camera-control writes (exposure/gain) are deferred into this dict and
+        # flushed on the acquisition thread, so changing a setting during a Live
+        # stream takes effect on the very next frame instead of racing GetNextImage.
+        self._pending_lock = threading.Lock()
+        self._pending = {}
         self.last_frame = None
 
 
@@ -130,33 +137,69 @@ class FlirCamera:
         return self._cam.Height.GetValue()
 
     def set_exposure(self, seconds):
+        # Record the request and try to apply it now; if the acquisition thread
+        # is mid-grab, it's flushed on the next frame instead (see grab_frame).
+        self._exposure = seconds
+        with self._pending_lock:
+            self._pending["exposure"] = seconds
+        self._maybe_flush()
+
+    def _write_exposure(self, seconds):
         nodemap = self._cam.GetNodeMap()
         exposure_auto = PySpin.CEnumerationPtr(nodemap.GetNode("ExposureAuto"))
         if PySpin.IsAvailable(exposure_auto) and PySpin.IsWritable(exposure_auto):
             exposure_auto.SetIntValue(exposure_auto.GetEntryByName("Off").GetValue())
-        
+
         exposure_time = PySpin.CFloatPtr(nodemap.GetNode("ExposureTime"))
         if PySpin.IsAvailable(exposure_time) and PySpin.IsWritable(exposure_time):
             # Spinnaker uses microseconds
             exposure_time.SetValue(seconds * 1_000_000)
-            self._exposure = seconds
 
     def get_exposure(self):
         return self._exposure
 
     def set_gain(self, gain_db):
+        self._gain = gain_db
+        with self._pending_lock:
+            self._pending["gain"] = gain_db
+        self._maybe_flush()
+
+    def _write_gain(self, gain_db):
         nodemap = self._cam.GetNodeMap()
         gain_auto = PySpin.CEnumerationPtr(nodemap.GetNode("GainAuto"))
         if PySpin.IsAvailable(gain_auto) and PySpin.IsWritable(gain_auto):
             gain_auto.SetIntValue(gain_auto.GetEntryByName("Off").GetValue())
-            
+
         gain_node = PySpin.CFloatPtr(nodemap.GetNode("Gain"))
         if PySpin.IsAvailable(gain_node) and PySpin.IsWritable(gain_node):
             gain_node.SetValue(gain_db)
-            self._gain = gain_db
 
     def get_gain_db(self):
         return self._gain
+
+    def _flush_pending(self):
+        """Apply any deferred control writes. Caller must hold self._lock."""
+        with self._pending_lock:
+            pending = self._pending
+            self._pending = {}
+        if "exposure" in pending:
+            self._write_exposure(pending["exposure"])
+        if "gain" in pending:
+            self._write_gain(pending["gain"])
+
+    def _maybe_flush(self):
+        """Flush now if the acquisition thread isn't holding the lock.
+
+        When idle (no Live stream) this applies the change immediately. During a
+        Live stream the grab may hold the lock, in which case we leave the value
+        pending and grab_frame flushes it before the next GetNextImage — keeping
+        all camera writes on a single thread and never blocking the UI.
+        """
+        if self._lock.acquire(blocking=False):
+            try:
+                self._flush_pending()
+            finally:
+                self._lock.release()
 
     def set_roi(self, n_rows):
         self._roi_rows = n_rows
@@ -169,6 +212,39 @@ class FlirCamera:
         node = PySpin.CBooleanPtr(nodemap.GetNode(name))
         if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
             node.SetValue(bool(value))
+
+    def _set_newest_only_buffering(self):
+        """Keep only the most recent frame in the stream buffer.
+
+        A live preview should always show the latest frame; the default
+        OldestFirst mode lets stale frames (captured with previous settings)
+        queue up and be delivered first. NewestOnly drops the backlog.
+        """
+        try:
+            snodemap = self._cam.GetTLStreamNodeMap()
+            mode = PySpin.CEnumerationPtr(snodemap.GetNode("StreamBufferHandlingMode"))
+            if PySpin.IsAvailable(mode) and PySpin.IsWritable(mode):
+                newest = mode.GetEntryByName("NewestOnly")
+                if PySpin.IsAvailable(newest) and PySpin.IsReadable(newest):
+                    mode.SetIntValue(newest.GetValue())
+        except Exception:
+            pass
+
+    def flush_stream(self):
+        """Discard frames buffered with stale settings so the next grab reflects
+        the current exposure/gain. Restarting acquisition clears the buffer pool
+        and drops any in-flight frame. Called when (re)starting a Live stream.
+        """
+        with self._lock:
+            # Make sure the latest exposure/gain are on the camera first, so the
+            # restarted stream begins capturing with the current settings.
+            self._flush_pending()
+            try:
+                if self._cam.IsStreaming():
+                    self._cam.EndAcquisition()
+                    self._cam.BeginAcquisition()
+            except Exception:
+                pass
 
     def _user_value_nodes(self, write=False):
         nodemap = self._cam.GetNodeMap()
@@ -271,6 +347,9 @@ class FlirCamera:
 
     def grab_frame(self):
         with self._lock:
+            # Apply any settings changed from the UI thread (exposure/gain) so a
+            # Live stream reflects them on this frame without a stop/start.
+            self._flush_pending()
             # Increase timeout for long exposures
             image_result = self._cam.GetNextImage(int(max(2000, (self._exposure * 1000) + 1000)))
             if image_result.IsIncomplete():
