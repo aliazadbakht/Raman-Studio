@@ -27,6 +27,18 @@ Set `RAMAN_PYTHON=/path/to/python ./run.sh` to force a specific Python.
 
 Calibration coefficients are stored in the OpenRAMAN Legendre basis.
 
+## Predict From Structure
+
+The Match panel can predict and overlay Raman spectra from a molecular structure
+using [Mol2Raman](https://github.com/salvasorrentino/Mol2Raman), a graph neural
+network model for Raman spectra from SMILES. Inputs can be SMILES strings,
+compound names, or formulas; real predictions require the Mol2Raman ML
+dependencies and trained checkpoints.
+
+Model bundle setup is documented in [`models/mol2raman/README.md`](models/mol2raman/README.md).
+Until the bundle is installed, the UI shows a clearly labelled demo prediction
+instead of a real Mol2Raman result.
+
 ## Reference Library
 
 Spectral reference data in `references/` is sourced from the
