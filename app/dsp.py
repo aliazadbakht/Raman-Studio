@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
-# Copyright (c) 2026 Wfront Principle B.V.
+# Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
+# Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
+# Portions Copyright (c) Luc Boussemaere (The Pulsar) — the Legendre
+# calibration basis and pixel normalisation convention are derived from the
+# OpenRAMAN Spectrum Analyzer (https://www.open-raman.org/), CERN-OHL-W-2.0.
 """Digital signal processing utilities for Raman spectra."""
 import numpy as np
 from numpy.polynomial import legendre

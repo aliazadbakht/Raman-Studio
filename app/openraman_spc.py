@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
-# Copyright (c) 2026 Wfront Principle B.V.
+# Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
+# Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
+# Portions Copyright (c) Luc Boussemaere (The Pulsar) — the .spc container
+# format (storage objects, string table, RLE0 encoding) is derived from the
+# OpenRAMAN Spectrum Analyzer (https://www.open-raman.org/), CERN-OHL-W-2.0.
 """Read and write OpenRAMAN Spectrum Analyzer .spc files."""
 from __future__ import annotations
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
-# Copyright (c) 2026 Wfront Principle B.V.
+# Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
+# Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 """Match panel — PySide6 port of match_panel.py.
 
 A dockable side panel that scores the current spectrum against a reference
