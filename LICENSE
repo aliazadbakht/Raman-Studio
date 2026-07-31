@@ -21,10 +21,10 @@ This work is a MODIFIED version of the OpenRAMAN Spectrum Analyzer
 which is also licensed under CERN-OHL-W v2.
 
 Modifications by Wfront Principle B.V. and Precisometer B.V., 2026:
-reimplementation as a macOS Python application, including a PySide6 user
-interface, a NumPy/SciPy processing and calibration back end, a spectral
-reference-library matching feature, and a structure-to-spectrum prediction
-feature. The OpenRAMAN `.spc`
+reimplementation as a cross-platform Python application ("Raman Studio"),
+including a PySide6 user interface, a NumPy/SciPy processing and calibration
+back end, a spectral reference-library matching feature, and a
+structure-to-spectrum prediction feature. The OpenRAMAN `.spc`
 container format, the camera calibration-blob layout, and the Legendre
 calibration basis are derived from the upstream OpenRAMAN work.
 

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
 # Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
 # Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
-"""PySide6 (Qt) GUI for the Raman Spectrum Analyzer.
+"""PySide6 (Qt) GUI for Raman Studio.
 
-A full-feature parallel front-end to app/gui.py (Tkinter), reusing every backend
-module unchanged (camera, dsp, fileio, library, matching). Run via main_qt.py.
+The current front end, reusing every backend module unchanged (camera, dsp,
+fileio, library, matching). The Tkinter front end under archive/ is superseded.
+Run via main_qt.py.
 """
 import os
 os.environ.setdefault("QT_API", "pyside6")
@@ -75,7 +76,7 @@ class RamanQtWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Raman Spectrum Analyzer")
+        self.setWindowTitle("Raman Studio")
         self.resize(1280, 820)
         self.setMinimumSize(900, 600)
         self.setStyleSheet(STYLE)
@@ -548,9 +549,15 @@ class RamanQtWindow(QMainWindow):
 
     def on_about(self):
         QMessageBox.information(self, "About",
-            "Raman Spectrum Analyzer\nmacOS Edition (Qt)\n\n"
-            "Based on The Pulsar Engineering SpectrumAnalyzer (CERN OHL-W v2)\n"
-            "PySide6 / Matplotlib")
+            "Raman Studio\n\n"
+            "Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)\n"
+            "Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)\n"
+            "Licensed under CERN-OHL-W v2.\n\n"
+            "A modified, independent port of the OpenRAMAN Spectrum Analyzer\n"
+            "(https://www.open-raman.org/), copyright (c) Luc Boussemaere\n"
+            "(The Pulsar), also under CERN-OHL-W v2. Not an official OpenRAMAN\n"
+            "release and not affiliated with or endorsed by OpenRAMAN.\n\n"
+            "PySide6 / NumPy / SciPy / Matplotlib")
 
     # ════════════════════════════════════════════════════════════════════════
     # File actions

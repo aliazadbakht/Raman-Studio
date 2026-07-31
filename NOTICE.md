@@ -1,6 +1,6 @@
 # Notices and attributions
 
-Raman Spectrum Analyzer for macOS
+Raman Studio
 
 Copyright (c) 2026 Wfront Principle B.V. — https://wfront.nl
 Copyright (c) 2026 Precisometer B.V. — https://precisometer.com

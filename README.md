@@ -1,8 +1,10 @@
-# Raman Spectrum Analyzer for macOS
+# Raman Studio
 
-A macOS application for acquiring, processing, calibrating, and identifying
-Raman spectra — an independent Python/Qt port of the
-[OpenRAMAN Spectrum Analyzer](https://www.open-raman.org/).
+A cross-platform desktop application for acquiring, processing, calibrating, and
+identifying Raman spectra. It reads and writes the file formats used by
+[OpenRAMAN](https://www.open-raman.org/) spectrometers and started life as a
+port of the OpenRAMAN Spectrum Analyzer, adding a Qt interface, spectral
+reference-library matching, and structure-based spectrum prediction.
 
 Copyright (c) 2026 [Wfront Principle B.V.](https://wfront.nl) and
 [Precisometer B.V.](https://precisometer.com) — licensed under
@@ -15,27 +17,60 @@ OpenRAMAN, same license.
 
 ## Install and run
 
+**macOS / Linux**
+
 ```bash
 ./install.sh
 ./run.sh
 ```
 
-`install.sh` creates a `venv/` and installs the dependencies in
-[requirements.txt](requirements.txt) (NumPy, SciPy, Matplotlib, PySide6).
+**Windows**
 
-FLIR/PointGrey camera capture additionally requires the FLIR Spinnaker SDK plus
-`PySpin` installed for the Python interpreter that `run.sh` uses. These are not
-pip-installable — get them from Teledyne FLIR. Without `PySpin` the app still
-opens, plots, processes, calibrates, and exports spectrum files; only live
-acquisition is unavailable.
+```bat
+install.bat
+run.bat
+```
 
-`run.sh` picks an interpreter in this order: `$RAMAN_PYTHON` if set, then a
-conda env at `/opt/anaconda3/envs/raman_flir` if it has `PySpin`, then the local
-`venv/`, then system `python3`. To force one:
+The installer creates a `venv/` and installs the dependencies in
+[requirements.txt](requirements.txt) (NumPy, SciPy, Matplotlib, PySide6) — all
+pure-Python or wheel-distributed, on every platform.
+
+### Camera support
+
+Live acquisition requires a FLIR/PointGrey camera, the FLIR Spinnaker SDK, and
+`PySpin` installed for the interpreter the launcher uses. Those are not
+pip-installable — get them from Teledyne FLIR. **Without `PySpin` the app still
+opens, plots, processes, calibrates, matches, and exports spectrum files**; only
+live capture is unavailable.
+
+The launchers add the SDK's default install location to the right environment
+variable for the platform, if it exists:
+
+| Platform | Variable | Default library path |
+| --- | --- | --- |
+| macOS | `DYLD_LIBRARY_PATH` | `/usr/local/lib` |
+| Linux | `LD_LIBRARY_PATH` | `/opt/spinnaker/lib` |
+| Windows | `PATH` | `C:\Program Files\Teledyne\Spinnaker\bin64\vs2015` |
+
+If your SDK is somewhere else, set the variable yourself before launching —
+an existing value is never overwritten.
+
+### Choosing the interpreter
+
+Set `RAMAN_PYTHON` to force one:
 
 ```bash
-RAMAN_PYTHON=/path/to/python ./run.sh
+RAMAN_PYTHON=/path/to/python ./run.sh     # or: set RAMAN_PYTHON=... && run.bat
 ```
+
+Otherwise `run.sh` tries, in order: `$RAMAN_PYTHON`, a Spinnaker-capable conda
+env (`$RAMAN_FLIR_PYTHON`, defaulting to `/opt/anaconda3/envs/raman_flir`), the
+local `venv/`, then system `python3`. `run.bat` tries `%RAMAN_PYTHON%`, the
+local `venv\`, then `python` on `PATH`.
+
+> **Platform testing:** development and testing happen on macOS. The Linux and
+> Windows paths are implemented and are expected to work, but are not covered by
+> routine testing — reports welcome.
 
 ## Features
 
@@ -93,6 +128,8 @@ is not a prediction.
 
 ```
 main_qt.py            entry point
+install.sh / .bat     dependency setup (macOS+Linux / Windows)
+run.sh / run.bat      launcher (macOS+Linux / Windows)
 app/                  application code
   gui_qt.py           main window (PySide6)
   match_panel_qt.py   library matching panel

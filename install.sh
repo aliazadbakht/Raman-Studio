@@ -1,7 +1,7 @@
 #!/bin/bash
-# Raman Spectrum Analyzer – macOS installer
+# Raman Studio – installer (macOS / Linux)
 set -e
-echo "=== Raman Spectrum Analyzer – macOS Setup ==="
+echo "=== Raman Studio – Setup ($(uname -s)) ==="
 
 # Check Python
 if ! command -v python3 &>/dev/null; then
@@ -28,4 +28,5 @@ echo "=== Installation complete ==="
 echo "Run the app with:  ./run.sh"
 echo ""
 echo "Camera note: FLIR/PointGrey capture requires the Spinnaker SDK and PySpin"
-echo "installed into the Python used by run.sh. File viewing/export works without PySpin."
+echo "installed into the Python used by run.sh. Opening, processing, and exporting"
+echo "spectrum files works without PySpin."
