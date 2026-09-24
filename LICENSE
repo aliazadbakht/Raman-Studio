@@ -1,4 +1,3 @@
-Copyright (c) 2026 Wfront Principle B.V. — https://wfront.nl
 Copyright (c) 2026 Precisometer B.V. — https://precisometer.com
 Portions Copyright (c) Luc Boussemaere (The Pulsar) — OpenRAMAN.
 
@@ -20,7 +19,7 @@ This work is a MODIFIED version of the OpenRAMAN Spectrum Analyzer
 (https://www.open-raman.org/), Copyright (c) Luc Boussemaere (The Pulsar),
 which is also licensed under CERN-OHL-W v2.
 
-Modifications by Wfront Principle B.V. and Precisometer B.V., 2026:
+Modifications by Precisometer B.V., 2026:
 reimplementation as a cross-platform Python application ("Raman Studio"),
 including a PySide6 user interface, a NumPy/SciPy processing and calibration
 back end, a spectral reference-library matching feature, and a

@@ -2,7 +2,6 @@
 
 Raman Studio
 
-Copyright (c) 2026 Wfront Principle B.V. — https://wfront.nl
 Copyright (c) 2026 Precisometer B.V. — https://precisometer.com
 
 Licensed under CERN-OHL-W-2.0 — see [LICENSE](LICENSE).

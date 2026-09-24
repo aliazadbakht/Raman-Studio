@@ -46,4 +46,4 @@ Dependencies are packaged for pure-Python or wheel distribution (`PySide6`, `Num
 ---
 
 ### 📄 License & Attributions
-Licensed under **[CERN-OHL-W v2](LICENSE)**. Copyright (c) 2026 Wfront Principle B.V. and Precisometer B.V. Portions copyright (c) Luc Boussemaere (The Pulsar), OpenRAMAN. See [`NOTICE.md`](NOTICE.md) for full attributions.
+Licensed under **[CERN-OHL-W v2](LICENSE)**. Copyright (c) 2026 Precisometer B.V. Base project is OpenRAMAN, portions copyright (c) Luc Boussemaere (The Pulsar), OpenRAMAN. See [`NOTICE.md`](NOTICE.md) for full attributions.

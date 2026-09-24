@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
-# Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
+# Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 # Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 # Portions Copyright (c) Luc Boussemaere (The Pulsar) — the calibration blob
 # stored in camera user memory (identifier, layout, checksum8) is derived from

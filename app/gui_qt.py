@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
-# Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
+# Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 # Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 """PySide6 (Qt) GUI for Raman Studio.
 
@@ -550,7 +550,6 @@ class RamanQtWindow(QMainWindow):
     def on_about(self):
         QMessageBox.information(self, "About",
             "Raman Studio\n\n"
-            "Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)\n"
             "Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)\n"
             "Licensed under CERN-OHL-W v2.\n\n"
             "A modified, independent port of the OpenRAMAN Spectrum Analyzer\n"

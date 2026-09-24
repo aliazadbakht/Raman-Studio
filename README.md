@@ -1,15 +1,13 @@
 # Raman Studio
 
-A cross-platform desktop application for acquiring, processing, calibrating, and
-identifying Raman spectra. It reads and writes the file formats used by
-[OpenRAMAN](https://www.open-raman.org/) spectrometers and started life as a
-port of the OpenRAMAN Spectrum Analyzer, adding a Qt interface, spectral
-reference-library matching, and structure-based spectrum prediction.
+[![Made by Precisometer](https://img.shields.io/badge/Made%20by-precisometer.com-0066cc?style=flat-square)](https://precisometer.com)
+[![License: CERN-OHL-W v2](https://img.shields.io/badge/License-CERN--OHL--W%20v2-green?style=flat-square)](LICENSE)
 
-Copyright (c) 2026 [Wfront Principle B.V.](https://wfront.nl) and
-[Precisometer B.V.](https://precisometer.com) — licensed under
-[CERN-OHL-W v2](LICENSE). Portions copyright (c) Luc Boussemaere (The Pulsar),
-OpenRAMAN, same license.
+**Raman Studio** is an open-source, cross-platform desktop application developed by **[Precisometer](https://precisometer.com)** for acquiring, processing, calibrating, and identifying Raman spectra. It reads and writes the file formats used by [OpenRAMAN](https://www.open-raman.org/) spectrometers and started life as a port of the OpenRAMAN Spectrum Analyzer, adding a modern Qt interface, spectral reference-library matching, and structure-based spectrum prediction.
+
+Copyright (c) 2026 [Precisometer B.V.](https://precisometer.com) — licensed under
+[CERN-OHL-W v2](LICENSE). Base project is [OpenRAMAN](https://www.open-raman.org/),
+portions copyright (c) Luc Boussemaere (The Pulsar), OpenRAMAN, same license.
 
 > **Not an official OpenRAMAN release.** This is a modified, independent port,
 > not affiliated with, endorsed by, or supported by OpenRAMAN or The Pulsar.
@@ -149,6 +147,23 @@ archive/              superseded Tkinter front end, kept for reference
 
 The Tkinter front end under `archive/` is superseded — `main_qt.py` and
 `app/gui_qt.py` are the current UI. The backend modules are shared.
+
+## Made by Precisometer
+
+**Raman Studio** is proudly developed and maintained by **[Precisometer](https://precisometer.com)** — your independent partner for precision photonics, optical microscopy, and scientific instrumentation.
+
+Precisometer empowers researchers, labs, and OEM developers by offering high-performance, cost-effective instruments and engineering services:
+
+- 🔬 **[Spectroscopy & Lasers](https://precisometer.com/spectroscopy)** — Narrow-linewidth excitation lasers (532 nm, 785 nm), spectrometers, monochromators, and optical filters tailored for Raman spectroscopy and fluorescence analysis.
+- 📷 **[Scientific Cameras](https://precisometer.com/cameras)** — Ultra-low-noise sCMOS, SWIR, and high-sensitivity CMOS sensors (including Sony Pregius and FLIR integrations) optimized for faint Raman scattering and high-resolution spectral acquisition.
+- 📐 **[Opto-Mechanics & Nanopositioning](https://precisometer.com/opto-mechanics)** — Stable cage systems, kinematic mirror mounts, manual translation stages, and ultra-precise cryogenic piezo actuators.
+- 🔬 **[Optical Microscopy](https://precisometer.com/microscopy)** — Modular optical tweezers, inverted and modular microscope platforms, and custom imaging systems.
+- 💡 **[Custom Engineering & Turnkey Solutions](https://precisometer.com/contact?type=custom)** — Custom optomechanical design, embedded firmware, specialized PCB electronics, and dedicated scientific software for your laboratory or industrial production.
+
+Need custom Raman spectrometers, specialized cameras, or custom photonics engineering?
+
+🌐 **Explore our catalog & solutions:** [precisometer.com](https://precisometer.com)  
+📬 **Get in touch for custom projects:** [info@precisometer.com](mailto:info@precisometer.com)
 
 ## License
 

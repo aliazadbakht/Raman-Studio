@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: CERN-OHL-W-2.0
-# Copyright (c) 2026 Wfront Principle B.V. (https://wfront.nl)
+# Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 # Copyright (c) 2026 Precisometer B.V. (https://precisometer.com)
 # Functional port of algorithms from Mol2Raman, Copyright (c) 2025
 # salvasorrentino, MIT (https://github.com/salvasorrentino/Mol2Raman).
